@@ -1,30 +1,16 @@
 import os
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
-from dotenv import load_dotenv
-from openai import OpenAI
+import httpx
 
-# 1. Nạp biến môi trường từ file .env
+# Load biến môi trường từ .env (local) hoặc từ Render env vars
 load_dotenv()
 
-# 2. Lấy API key từ biến môi trường
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# 3. Tạo client OpenAI
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# 4. Tạo ứng dụng FastAPI
 app = FastAPI()
 
-
-# 5. Định nghĩa dữ liệu gửi tới API /chat
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-
-
-# 6. System prompt đơn giản cho "Wellbeing Agent"
+# TODO: dán SYSTEM_PROMPT CBT + wellbeing + Uni support của bạn vào đây
 SYSTEM_PROMPT = """
 You are a friendly, non-clinical, CBT-informed wellbeing companion for first-year university students.
 
@@ -137,50 +123,63 @@ STYLE
 
 """
 
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
 
-# 7. Endpoint kiểm tra server
-@app.get("/")
-def root():
-    return {"message": "Wellbeing Agent backend with AI is running"}
-
-
-# 8. Hàm gọi OpenAI để lấy câu trả lời
-def call_openai(user_message: str) -> str:
-    """
-    Gửi tin nhắn lên OpenAI và lấy câu trả lời.
-    """
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
-
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        temperature=0.7,
-    )
-
-    reply_text = response.choices[0].message.content
-    return reply_text
+class ChatResponse(BaseModel):
+    reply: str
 
 
-# 9. Endpoint chính /chat
-@app.post("/chat")
-def chat(req: ChatRequest):
-    """
-    Nhận message từ người dùng, gửi qua OpenAI, trả lời lại.
-    """
-    if not OPENAI_API_KEY:
-        return {
-            "error": "OPENAI_API_KEY chưa được thiết lập. Hãy kiểm tra file .env."
-        }
+async def call_openai(user_id: str, message: str) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return "Lỗi cấu hình: thiếu OPENAI_API_KEY trên server. Hãy báo lại cho quản trị viên."
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"User ID: {user_id}\nTin nhắn: {message}"
+            },
+        ],
+        "temperature": 0.4,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    data = resp.json()
+
+    # Nếu OpenAI lỗi, trả về thông báo dễ hiểu
+    if resp.status_code != 200:
+        return f"Hệ thống AI đang gặp lỗi ({resp.status_code}). Vui lòng thử lại sau."
 
     try:
-        ai_reply = call_openai(req.message)
-    except Exception as e:
-        return {"error": f"Lỗi khi gọi OpenAI: {str(e)}"}
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return "Hệ thống AI gặp lỗi khi đọc kết quả trả về. Vui lòng thử lại sau."
 
-    return {
-        "user_id": req.user_id,
-        "reply": ai_reply,
-    }
+
+@app.get("/")
+async def root():
+    return {"message": "Wellbeing Agent backend with AI is running (FastAPI 0.95.2, httpx)."}
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(req: ChatRequest):
+    reply = await call_openai(req.user_id, req.message)
+    return ChatResponse(reply=reply)
+
