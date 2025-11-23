@@ -1,16 +1,35 @@
 import os
+from typing import Dict, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
-import httpx
+from openai import OpenAI
 
-# Load biến môi trường từ .env (local) hoặc từ Render env vars
+# --------------------------------------------------
+# 1. Khởi tạo app & client OpenAI
+# --------------------------------------------------
+
+# Dùng .env khi chạy local (Render sẽ dùng env var nên vẫn OK)
 load_dotenv()
 
-app = FastAPI()
+# OPENAI_API_KEY phải tồn tại trong môi trường
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# TODO: dán SYSTEM_PROMPT CBT + wellbeing + Uni support của bạn vào đây
+app = FastAPI(
+    title="Wellbeing Agent Backend",
+    description=(
+        "AI Wellbeing Agent hỗ trợ sinh viên năm nhất trong giai đoạn "
+        "chuyển tiếp lên đại học (MVP, không thay thế chuyên gia)."
+    ),
+    version="0.2.0",
+)
+
+# --------------------------------------------------
+# 2. Prompt nền (CBT + wellbeing + support links)
+#    -> Bạn có thể chỉnh sửa nội dung này trên GitHub
+# --------------------------------------------------
+
 SYSTEM_PROMPT = """
 You are a friendly, non-clinical, CBT-informed wellbeing companion for first-year university students.
 
@@ -123,63 +142,124 @@ STYLE
 
 """
 
+# --------------------------------------------------
+# 3. Kiểu dữ liệu request/response
+# --------------------------------------------------
+
+
 class ChatRequest(BaseModel):
+    """
+    Một lượt tin nhắn từ phía sinh viên.
+    Mỗi user_id sẽ có lịch sử hội thoại riêng.
+    """
     user_id: str
     message: str
 
+
 class ChatResponse(BaseModel):
+    """
+    Trả về nội dung trả lời của agent.
+    """
     reply: str
 
 
-async def call_openai(user_id: str, message: str) -> str:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return "Lỗi cấu hình: thiếu OPENAI_API_KEY trên server. Hãy báo lại cho quản trị viên."
+# --------------------------------------------------
+# 4. Bộ nhớ hội thoại đơn giản (in-memory)
+#    conversations[user_id] = [ {role, content}, ... ]
+# --------------------------------------------------
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": f"User ID: {user_id}\nTin nhắn: {message}"
-            },
-        ],
-        "temperature": 0.4,
-    }
+conversations: Dict[str, List[dict]] = {}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
+
+def get_or_create_history(user_id: str) -> List[dict]:
+    """
+    Lấy lịch sử hội thoại của user.
+    Nếu chưa có thì tạo mới với system prompt.
+    """
+    if user_id not in conversations:
+        conversations[user_id] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+    return conversations[user_id]
+
+
+# --------------------------------------------------
+# 5. Hàm gọi OpenAI với lịch sử hội thoại
+# --------------------------------------------------
+
+
+async def generate_reply(user_id: str, user_message: str) -> str:
+    # 1. Lấy lịch sử hiện tại
+    history = get_or_create_history(user_id)
+
+    # 2. Thêm tin nhắn mới của user
+    history.append({"role": "user", "content": user_message})
+
+    # 3. Gọi OpenAI với toàn bộ history
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=history,
+            temperature=0.4,
+        )
+    except Exception as e:
+        # Không vỡ app nếu OpenAI lỗi – trả message dễ hiểu cho user
+        return (
+            "Hiện tại hệ thống AI đang gặp lỗi kỹ thuật khi kết nối tới OpenAI. "
+            "Bạn có thể thử lại sau một lúc nữa, hoặc liên hệ trực tiếp các dịch vụ hỗ trợ của trường. "
+            f"(Thông tin kỹ thuật: {type(e).__name__})"
         )
 
-    data = resp.json()
+    reply = completion.choices[0].message.content
 
-    # Nếu OpenAI lỗi, trả về thông báo dễ hiểu
-    if resp.status_code != 200:
-        return f"Hệ thống AI đang gặp lỗi ({resp.status_code}). Vui lòng thử lại sau."
+    # 4. Lưu câu trả lời của agent vào lịch sử
+    history.append({"role": "assistant", "content": reply})
 
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        return "Hệ thống AI gặp lỗi khi đọc kết quả trả về. Vui lòng thử lại sau."
+    # 5. Giới hạn độ dài lịch sử (ví dụ 40 message gần nhất để tiết kiệm token)
+    conversations[user_id] = history[-40:]
+
+    return reply
+
+
+# --------------------------------------------------
+# 6. Các endpoint FastAPI
+# --------------------------------------------------
 
 
 @app.get("/")
 async def root():
-    return {"message": "Wellbeing Agent backend with AI is running (FastAPI 0.95.2, httpx)."}
+    """
+    Kiểm tra nhanh xem backend còn sống không.
+    """
+    return {
+        "message": "Wellbeing Agent backend with memory is running.",
+        "docs": "/docs",
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(req: ChatRequest):
-    reply = await call_openai(req.user_id, req.message)
+async def chat(req: ChatRequest):
+    """
+    Endpoint chính cho hội thoại.
+    Mỗi lần frontend gửi một tin nhắn, nó gọi /chat một lần.
+
+    - Backend sẽ:
+        1) Gộp với lịch sử trước đó của user_id.
+        2) Gửi toàn bộ vào OpenAI.
+        3) Trả về câu trả lời mới và cập nhật bộ nhớ.
+    """
+    reply = await generate_reply(req.user_id, req.message)
     return ChatResponse(reply=reply)
 
+
+@app.post("/reset/{user_id}")
+async def reset_conversation(user_id: str):
+    """
+    Cho phép xoá lịch sử hội thoại của một sinh viên.
+    Có thể dùng khi:
+    - SV bắt đầu một chủ đề hoàn toàn mới.
+    - Bạn muốn "reset" context để nghiên cứu.
+    """
+    if user_id in conversations:
+        del conversations[user_id]
+    return {"status": "ok", "message": f"Đã reset hội thoại cho user_id={user_id}."}
