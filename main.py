@@ -1,37 +1,27 @@
 import os
 from typing import Dict, List
 
-from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
 from openai import OpenAI
 
-# --------------------------------------------------
-# 1. Khởi tạo app & client OpenAI
-# --------------------------------------------------
-
+# -------------------------------------------------
+# 1. Load environment & init OpenAI client
+# -------------------------------------------------
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is not set in environment or .env file")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set in environment variables.")
+# Tuyệt đối KHÔNG truyền 'proxies' để tránh lỗi trên Render
+client = OpenAI(api_key=api_key)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-app = FastAPI(
-    title="Wellbeing Agent Backend",
-    description=(
-        "AI wellbeing companion cho sinh viên năm nhất, dùng CBT ở mức giáo dục, "
-        "không thay thế chuyên gia hoặc dịch vụ khủng hoảng."
-    ),
-    version="0.3.0",
-)
-
-# --------------------------------------------------
-# 2. SYSTEM PROMPT (theo yêu cầu của bạn)
-# --------------------------------------------------
-
+# -------------------------------------------------
+# 2. System prompt CBT + wellbeing + Uni of Adelaide
+# -------------------------------------------------
 SYSTEM_PROMPT = """
 You are a friendly, non-clinical, CBT-informed wellbeing companion for first-year university students.
 
@@ -46,7 +36,7 @@ Internally (not visible to the student), you always:
 1. Identify the situation or trigger.
 2. Notice the student's main automatic thoughts or beliefs.
 3. Identify the emotions and (if mentioned) body sensations.
-4. Consider possible cognitive distortions (e.g., all-or-nothing thinking, catastrophizing, mind-reading, overgeneralisation).
+4. Consider possible cognitive distortions (e.g., all-or-nothing thinking, catastrophizing, mind-reading, overgeneralisations).
 5. Suggest 1–2 alternative, more balanced thoughts.
 6. Suggest 1–3 small, realistic behavioural experiments or actions they can try.
 
@@ -67,7 +57,7 @@ Every time you answer, follow this structure:
 
 4. PRACTICAL STEPS / BEHAVIOURAL EXPERIMENTS
    - Provide a bullet list of 2–4 concrete actions they can try in the next 24–72 hours.
-   - Make these actions very small, realistic, and specific (e.g., "write down your main worry and one alternative explanation", "send one message to a classmate", "take a 5-minute walk and notice your breathing").
+   - Make these actions very small, realistic, and specific (e.g., 'write down your main worry and one alternative explanation', 'send one message to a classmate', 'take a 5-minute walk and notice your breathing').
 
 5. HELP-SEEKING ENCOURAGEMENT
    - End with 1–3 sentences gently encouraging them to talk to supportive people (friends, family, mentors, university services).
@@ -91,14 +81,15 @@ then you MUST:
 
 ADDITIONAL SUPPORT INFORMATION
 If the student expresses a need for help, you may refer them to:
-- The University of Adelaide Student Health & Wellbeing website: https://www.adelaide.edu.au/student/wellbeing/ 
+- The University of Adelaide Student Health & Wellbeing website: https://www.adelaide.edu.au/student/wellbeing/
   This site contains self-help resources, tips for stress, anxiety, exam support and more.
-- The University of Adelaide Counselling Service (Wellbeing Hub): 
+- The University of Adelaide Counselling Service (Wellbeing Hub):
     Phone: +61 8 8313 5663
     Email: counselling.centre@adelaide.edu.au
 - The University of Adelaide Support for Students page: https://www.adelaide.edu.au/student/support/
 
-You should encourage the student: “If you feel your wellbeing is seriously affected or you think you need to talk to someone, you can visit these links or contact the counselling centre. You’re not alone.”
+You should encourage the student with a sentence like:
+'If you feel your wellbeing is seriously affected or you think you need to talk to someone, you can visit these links or contact the counselling centre. You are not alone.'
 
 UNIVERSITY-SPECIFIC SUPPORT (IMPORTANT)
 When the student mentions difficulties related to:
@@ -117,7 +108,7 @@ Use the following verified information:
    - Financial hardship support, payment plan options, grants and emergency assistance:
      https://www.adelaide.edu.au/student/finance/
    - Student finance enquiries email:
-     studentfinance@adelaide.edu.au  
+     studentfinance@adelaide.edu.au
 
 2. INTERNATIONAL STUDENT SUPPORT
    - International Student Support homepage:
@@ -128,8 +119,8 @@ Use the following verified information:
 
 When referring to these services:
 - keep a warm, supportive tone,
-- do not imply that the student “must” contact them,
-- frame it as “you might find it helpful to reach out…”,
+- do not imply that the student must contact them,
+- frame it as 'you might find it helpful to reach out…',
 - remind them they are not alone and help is available.
 
 Do NOT give legal or migration advice. Refer students only to official university services or to Migration Agents where appropriate.
@@ -145,11 +136,17 @@ STYLE
 - Keep answers focused and not too long (about 3–6 short paragraphs plus bullets).
 """
 
-# --------------------------------------------------
-# 3. Kiểu dữ liệu request / response
-# --------------------------------------------------
+# -------------------------------------------------
+# 3. In-memory conversation store (per user)
+# -------------------------------------------------
+# Simple in-memory history: user_id -> list[ {role, content} ]
+conversation_store: Dict[str, List[Dict[str, str]]] = {}
+MAX_HISTORY_MESSAGES = 12  # chỉ giữ ~6 lượt hỏi–đáp gần nhất
 
 
+# -------------------------------------------------
+# 4. FastAPI models & app
+# -------------------------------------------------
 class ChatRequest(BaseModel):
     user_id: str
     message: str
@@ -159,85 +156,89 @@ class ChatResponse(BaseModel):
     reply: str
 
 
-# --------------------------------------------------
-# 4. Bộ nhớ hội thoại theo user_id (in-memory)
-# --------------------------------------------------
+app = FastAPI(title="Wellbeing Agent API", version="0.2.0")
 
-conversations: Dict[str, List[dict]] = {}
-
-
-def get_or_create_history(user_id: str) -> List[dict]:
-    """
-    Lấy lịch sử hội thoại cho user_id.
-    Nếu chưa có thì tạo mới với system prompt.
-    """
-    if user_id not in conversations:
-        conversations[user_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-    return conversations[user_id]
+# Cho phép gọi từ bất cứ frontend nào (tạm thời cho dev)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# --------------------------------------------------
-# 5. Hàm gọi OpenAI với lịch sử hội thoại
-# --------------------------------------------------
+# -------------------------------------------------
+# 5. Helper: lấy / lưu history cho từng user
+# -------------------------------------------------
+def get_user_history(user_id: str) -> List[Dict[str, str]]:
+    return conversation_store.get(user_id, [])
 
 
-def call_openai_with_history(user_id: str, user_message: str) -> str:
-    history = get_or_create_history(user_id)
+def append_to_history(user_id: str, user_msg: str, assistant_msg: str) -> None:
+    history = conversation_store.get(user_id, [])
 
-    # Thêm tin nhắn user
-    history.append({"role": "user", "content": user_message})
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": assistant_msg})
 
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=history,
-            temperature=0.4,
-        )
-    except Exception as e:
-        # Không cho app sập nếu OpenAI lỗi
-        return (
-            "Hiện tại hệ thống AI đang gặp lỗi kỹ thuật khi kết nối tới OpenAI. "
-            "Bạn có thể thử lại sau một lúc nữa, hoặc liên hệ trực tiếp các dịch vụ hỗ trợ của trường. "
-            f"(Thông tin kỹ thuật: {type(e).__name__})"
-        )
+    # Cắt bớt cho gọn (tính cả user + assistant)
+    if len(history) > MAX_HISTORY_MESSAGES:
+        history = history[-MAX_HISTORY_MESSAGES:]
 
-    reply = completion.choices[0].message.content
-
-    # Lưu câu trả lời vào lịch sử
-    history.append({"role": "assistant", "content": reply})
-
-    # Giới hạn số message để tránh quá dài
-    conversations[user_id] = history[-40:]
-
-    return reply
+    conversation_store[user_id] = history
 
 
-# --------------------------------------------------
-# 6. Các endpoint FastAPI
-# --------------------------------------------------
-
-
+# -------------------------------------------------
+# 6. Health check
+# -------------------------------------------------
 @app.get("/")
 async def root():
-    return {
-        "message": "Wellbeing Agent backend with CBT-informed system prompt is running.",
-        "docs": "/docs",
-    }
+    return {"status": "ok", "message": "Wellbeing agent backend is running."}
 
 
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
+# -------------------------------------------------
+# 7. Main chat endpoint (có memory)
+# -------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    reply = call_openai_with_history(req.user_id, req.message)
-    return ChatResponse(reply=reply)
+async def chat_endpoint(payload: ChatRequest):
+    try:
+        user_id = payload.user_id.strip() or "anonymous"
+        user_message = payload.message.strip()
 
+        if not user_message:
+            raise HTTPException(status_code=400, detail="Message must not be empty.")
 
-@app.post("/reset/{user_id}")
-async def reset_conversation(user_id: str):
-    """
-    Xoá lịch sử hội thoại của một user.
-    """
-    if user_id in conversations:
-        del conversations[user_id]
-    return {"status": "ok", "message": f"Conversation for user_id={user_id} has been reset."}
+        # Lấy lịch sử hội thoại của user
+        history = get_user_history(user_id)
+
+        # Ghép messages: system + history + câu hỏi mới
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
+        # Gọi OpenAI
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            temperature=0.6,
+            max_tokens=700,
+        )
+
+        reply = completion.choices[0].message.content.strip()
+
+        # Lưu lại vào history
+        append_to_history(user_id, user_message, reply)
+
+        return ChatResponse(reply=reply)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Log đơn giản ra server log, client chỉ thấy thông báo chung
+        print("Error in /chat:", repr(e))
+        raise HTTPException(status_code=500, detail="Internal server error.")
