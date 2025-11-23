@@ -17,7 +17,11 @@ if not api_key:
     raise RuntimeError("OPENAI_API_KEY is not set in environment or .env file")
 
 # Tuyệt đối KHÔNG truyền 'proxies' để tránh lỗi trên Render
-client = OpenAI(api_key=api_key)
+client = OpenAI(
+    api_key=api_key,
+    base_url="https://api.openai.com/v1"
+)
+
 
 # -------------------------------------------------
 # 2. System prompt CBT + wellbeing + Uni of Adelaide
