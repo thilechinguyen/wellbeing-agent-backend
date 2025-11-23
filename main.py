@@ -10,24 +10,26 @@ from openai import OpenAI
 # 1. Khởi tạo app & client OpenAI
 # --------------------------------------------------
 
-# Dùng .env khi chạy local (Render sẽ dùng env var nên vẫn OK)
 load_dotenv()
 
-# OPENAI_API_KEY phải tồn tại trong môi trường
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set in environment variables.")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(
     title="Wellbeing Agent Backend",
     description=(
-        "AI Wellbeing Agent hỗ trợ sinh viên năm nhất trong giai đoạn "
-        "chuyển tiếp lên đại học (MVP, không thay thế chuyên gia)."
+        "AI wellbeing companion cho sinh viên năm nhất, dùng CBT ở mức giáo dục, "
+        "không thay thế chuyên gia hoặc dịch vụ khủng hoảng."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # --------------------------------------------------
-# 2. Prompt nền (CBT + wellbeing + support links)
-#    -> Bạn có thể chỉnh sửa nội dung này trên GitHub
+# 2. SYSTEM PROMPT (theo yêu cầu của bạn)
 # --------------------------------------------------
 
 SYSTEM_PROMPT = """
@@ -93,10 +95,11 @@ If the student expresses a need for help, you may refer them to:
   This site contains self-help resources, tips for stress, anxiety, exam support and more.
 - The University of Adelaide Counselling Service (Wellbeing Hub): 
     Phone: +61 8 8313 5663
-    Email: counselling.centre@adelaide.edu.au  :contentReference[oaicite:4]{index=4}
-- The University of Adelaide Support for Students page: https://www.adelaide.edu.au/student/support/  :contentReference[oaicite:5]{index=5}
+    Email: counselling.centre@adelaide.edu.au
+- The University of Adelaide Support for Students page: https://www.adelaide.edu.au/student/support/
 
 You should encourage the student: “If you feel your wellbeing is seriously affected or you think you need to talk to someone, you can visit these links or contact the counselling centre. You’re not alone.”
+
 UNIVERSITY-SPECIFIC SUPPORT (IMPORTANT)
 When the student mentions difficulties related to:
 - tuition fees,
@@ -134,38 +137,30 @@ Do NOT give legal or migration advice. Refer students only to official universit
 If the student shows severe distress (e.g., panic, extreme overwhelm):
 - acknowledge feelings first,
 - then offer these support options as possible next steps.
+
 STYLE
 - Use warm, simple, non-judgemental language.
 - Avoid clinical terminology and diagnoses.
 - Do not talk about CBT theory explicitly unless the student asks. Show CBT through your questions and suggestions.
 - Keep answers focused and not too long (about 3–6 short paragraphs plus bullets).
-
 """
 
 # --------------------------------------------------
-# 3. Kiểu dữ liệu request/response
+# 3. Kiểu dữ liệu request / response
 # --------------------------------------------------
 
 
 class ChatRequest(BaseModel):
-    """
-    Một lượt tin nhắn từ phía sinh viên.
-    Mỗi user_id sẽ có lịch sử hội thoại riêng.
-    """
     user_id: str
     message: str
 
 
 class ChatResponse(BaseModel):
-    """
-    Trả về nội dung trả lời của agent.
-    """
     reply: str
 
 
 # --------------------------------------------------
-# 4. Bộ nhớ hội thoại đơn giản (in-memory)
-#    conversations[user_id] = [ {role, content}, ... ]
+# 4. Bộ nhớ hội thoại theo user_id (in-memory)
 # --------------------------------------------------
 
 conversations: Dict[str, List[dict]] = {}
@@ -173,7 +168,7 @@ conversations: Dict[str, List[dict]] = {}
 
 def get_or_create_history(user_id: str) -> List[dict]:
     """
-    Lấy lịch sử hội thoại của user.
+    Lấy lịch sử hội thoại cho user_id.
     Nếu chưa có thì tạo mới với system prompt.
     """
     if user_id not in conversations:
@@ -188,14 +183,12 @@ def get_or_create_history(user_id: str) -> List[dict]:
 # --------------------------------------------------
 
 
-async def generate_reply(user_id: str, user_message: str) -> str:
-    # 1. Lấy lịch sử hiện tại
+def call_openai_with_history(user_id: str, user_message: str) -> str:
     history = get_or_create_history(user_id)
 
-    # 2. Thêm tin nhắn mới của user
+    # Thêm tin nhắn user
     history.append({"role": "user", "content": user_message})
 
-    # 3. Gọi OpenAI với toàn bộ history
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -203,7 +196,7 @@ async def generate_reply(user_id: str, user_message: str) -> str:
             temperature=0.4,
         )
     except Exception as e:
-        # Không vỡ app nếu OpenAI lỗi – trả message dễ hiểu cho user
+        # Không cho app sập nếu OpenAI lỗi
         return (
             "Hiện tại hệ thống AI đang gặp lỗi kỹ thuật khi kết nối tới OpenAI. "
             "Bạn có thể thử lại sau một lúc nữa, hoặc liên hệ trực tiếp các dịch vụ hỗ trợ của trường. "
@@ -212,10 +205,10 @@ async def generate_reply(user_id: str, user_message: str) -> str:
 
     reply = completion.choices[0].message.content
 
-    # 4. Lưu câu trả lời của agent vào lịch sử
+    # Lưu câu trả lời vào lịch sử
     history.append({"role": "assistant", "content": reply})
 
-    # 5. Giới hạn độ dài lịch sử (ví dụ 40 message gần nhất để tiết kiệm token)
+    # Giới hạn số message để tránh quá dài
     conversations[user_id] = history[-40:]
 
     return reply
@@ -228,39 +221,23 @@ async def generate_reply(user_id: str, user_message: str) -> str:
 
 @app.get("/")
 async def root():
-    """
-    Kiểm tra nhanh xem backend còn sống không.
-    """
     return {
-        "message": "Wellbeing Agent backend with memory is running.",
+        "message": "Wellbeing Agent backend with CBT-informed system prompt is running.",
         "docs": "/docs",
     }
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """
-    Endpoint chính cho hội thoại.
-    Mỗi lần frontend gửi một tin nhắn, nó gọi /chat một lần.
-
-    - Backend sẽ:
-        1) Gộp với lịch sử trước đó của user_id.
-        2) Gửi toàn bộ vào OpenAI.
-        3) Trả về câu trả lời mới và cập nhật bộ nhớ.
-    """
-    reply = await generate_reply(req.user_id, req.message)
+    reply = call_openai_with_history(req.user_id, req.message)
     return ChatResponse(reply=reply)
 
 
 @app.post("/reset/{user_id}")
 async def reset_conversation(user_id: str):
     """
-    Cho phép xoá lịch sử hội thoại của một sinh viên.
-    Có thể dùng khi:
-    - SV bắt đầu một chủ đề hoàn toàn mới.
-    - Bạn muốn "reset" context để nghiên cứu.
+    Xoá lịch sử hội thoại của một user.
     """
     if user_id in conversations:
         del conversations[user_id]
-    return {"status": "ok", "message": f"Đã reset hội thoại cho user_id={user_id}."}
-
+    return {"status": "ok", "message": f"Conversation for user_id={user_id} has been reset."}
