@@ -263,3 +263,4 @@ async def reset_conversation(user_id: str):
     if user_id in conversations:
         del conversations[user_id]
     return {"status": "ok", "message": f"Đã reset hội thoại cho user_id={user_id}."}
+
