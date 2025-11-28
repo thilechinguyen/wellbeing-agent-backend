@@ -1,6 +1,9 @@
 import os
 import json
-from typing import Dict, List
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +12,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 # -------------------------------------------------
-# 1. Load environment & init OpenAI client
+# 1. Load env & init OpenAI client
 # -------------------------------------------------
 load_dotenv()
 
@@ -17,14 +20,13 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY is not set in environment or .env file")
 
-# Không cấu hình proxy để tránh lỗi trên Render
 client = OpenAI(
     api_key=api_key,
     base_url="https://api.openai.com/v1",
 )
 
 # -------------------------------------------------
-# 2. System prompt tổng thể (tham khảo nội bộ)
+# 2. System prompts (overall + agents)
 # -------------------------------------------------
 SYSTEM_PROMPT = """
 You are a friendly, non-clinical, CBT-informed wellbeing companion for first-year university students.
@@ -48,62 +50,31 @@ RESPONSE STRUCTURE
 Every time you answer, follow this structure:
 
 1. EMOTIONAL VALIDATION (2–4 sentences)
-   - Acknowledge and normalise the student's emotions.
-   - Show that their feelings make sense in context.
-
 2. CBT-STYLE REFLECTION (2–4 sentences)
-   - Briefly reflect the situation, the possible thoughts, and how those thoughts may affect their feelings and behaviour.
-   - Use simple language, not technical jargon.
-
 3. COGNITIVE REFRAME (1–3 sentences)
-   - Offer 1–2 more balanced, compassionate ways of looking at the situation.
-   - Phrase them as suggestions or possibilities, not as forced positivity.
-
-4. PRACTICAL STEPS / BEHAVIOURAL EXPERIMENTS
-   - Provide a bullet list of 2–4 concrete actions they can try in the next 24–72 hours.
-   - Make these actions very small, realistic, and specific (e.g., "write down your main worry and one alternative explanation", "send one message to a classmate", "take a 5-minute walk and notice your breathing").
-
-5. HELP-SEEKING ENCOURAGEMENT
-   - End with 1–3 sentences gently encouraging them to talk to supportive people (friends, family, mentors, university services).
-   - Remind them that it is okay to ask for help and that they do not have to handle everything alone.
+4. PRACTICAL STEPS / BEHAVIOURAL EXPERIMENTS (2–4 bullet points)
+5. HELP-SEEKING ENCOURAGEMENT (1–3 sentences)
 
 SAFETY AND CRISIS
-You must stay within a non-clinical, supportive role.
+- Stay within a non-clinical, supportive role.
+- If there are signs of suicidal thoughts, self-harm, wanting to die, harming others, or a very severe crisis:
+  - Say clearly that you are not a crisis service.
+  - Encourage them to contact emergency services, crisis hotlines or university counselling.
+  - Keep the message short, calm, supportive.
 
-If the student mentions:
-- suicidal thoughts,
-- self-harm,
-- wanting to die,
-- harming others,
-- or a very severe crisis,
-
-then you MUST:
-- Clearly say that you are not a crisis service or a substitute for professional help.
-- Encourage them to immediately contact local emergency services, crisis hotlines, or university counselling.
-- Keep your message short, calm, supportive, and focused on helping them reach real-world support.
-- Avoid giving detailed instructions or advice on self-harm or suicide.
-
-ADDITIONAL SUPPORT INFORMATION
-If the student expresses a need for help, you may refer them to:
+ADDITIONAL SUPPORT
+You may refer students to:
 - The University of Adelaide Student Health & Wellbeing website: https://www.adelaide.edu.au/student/wellbeing/
 - The University of Adelaide Counselling Service (Wellbeing Hub):
     Phone: +61 8 8313 5663
     Email: counselling.centre@adelaide.edu.au
 - The University of Adelaide Support for Students page: https://www.adelaide.edu.au/student/support/
 
-UNIVERSITY-SPECIFIC SUPPORT (IMPORTANT)
-When the student mentions financial stress, visa/payment issues or international-student-specific concerns, gently suggest official university support channels (Student Finance, International Student Support, etc.) and remind them they are not alone.
-
-STYLE
-- Use warm, simple, non-judgemental language.
-- Avoid clinical terminology and diagnoses.
-- Do not talk about CBT theory explicitly unless the student asks.
-- Keep answers focused and not too long (about 3–6 short paragraphs plus bullets).
+When financial stress, visa/payment issues or international-student concerns appear, gently mention:
+- Student Finance: https://www.adelaide.edu.au/student/finance/
+- International Student Support: https://www.adelaide.edu.au/student/international/
 """
 
-# -------------------------------------------------
-# 2b. System prompt cho từng AGENT
-# -------------------------------------------------
 EMOTION_AGENT_PROMPT = """
 You are an Emotion & Theme Analyzer for a wellbeing chatbot.
 Your job is to read the student's latest message (and a bit of context)
@@ -141,10 +112,10 @@ LANGUAGE RULES (VERY IMPORTANT)
 Your job:
 - Follow the RESPONSE STRUCTURE from the main SYSTEM_PROMPT (validation, CBT reflection, reframe, practical steps, help-seeking).
 - Keep the tone warm, gentle, non-clinical.
-- You can use bullet points for practical steps.
+- Use bullet points for practical steps.
 
 Output:
-- A natural language reply to the student (no JSON), ready to be sent, written only in the specified language.
+- A natural-language reply to the student (no JSON), ready to be sent, written only in the specified language.
 """
 
 SAFETY_AGENT_PROMPT = """
@@ -173,7 +144,7 @@ Your job:
 Rules:
 - If risk_level == "none":
     - should_override = false
-    - safety_message can be an empty string "".
+    - safety_message can be "".
 - If risk_level == "moderate":
     - should_override = false
     - safety_message = 1–3 sentences gently encouraging them to seek support (friends, family, university counselling, but not emergency).
@@ -185,37 +156,111 @@ Respond ONLY with valid JSON. No extra text.
 """
 
 # -------------------------------------------------
-# 3. In-memory conversation store (per user)
+# 3. In-memory conversation store
 # -------------------------------------------------
-# Simple in-memory history: user_id -> list[{role, content}]
 conversation_store: Dict[str, List[Dict[str, str]]] = {}
-MAX_HISTORY_MESSAGES = 12  # ~6 lượt hỏi–đáp
+MAX_HISTORY_MESSAGES = 12  # ~6 turns
 
 # -------------------------------------------------
-# 4. FastAPI models & app
+# 4. DB setup (SQLite) – for research logging
+# -------------------------------------------------
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "wellbeing_logs.db"
+
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                user_id TEXT,
+                condition TEXT,
+                lang_code TEXT,
+                user_message TEXT,
+                assistant_reply TEXT,
+                emotion_json TEXT,
+                safety_json TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_interaction(
+    *,
+    user_id: str,
+    condition: Optional[str],
+    lang_code: str,
+    user_message: str,
+    assistant_reply: str,
+    emotion_info: dict,
+    safety_info: dict,
+) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO messages (
+                timestamp, user_id, condition, lang_code,
+                user_message, assistant_reply,
+                emotion_json, safety_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.utcnow().isoformat(),
+                user_id,
+                condition,
+                lang_code,
+                user_message,
+                assistant_reply,
+                json.dumps(emotion_info, ensure_ascii=False),
+                json.dumps(safety_info, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+# -------------------------------------------------
+# 5. FastAPI models & app
 # -------------------------------------------------
 class ChatRequest(BaseModel):
     user_id: str
     message: str
+    # condition cho research (A/B, multi-agent vs single-agent, v.v.)
+    condition: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     reply: str
 
 
-app = FastAPI(title="Wellbeing Agent API", version="0.3.0")
+app = FastAPI(title="Wellbeing Agent API", version="0.4.0")
 
-# Cho phép gọi từ bất cứ frontend nào (dev)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # chỉnh lại domain thật khi deploy production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
 # -------------------------------------------------
-# 5. History helpers
+# 6. History helpers
 # -------------------------------------------------
 def get_user_history(user_id: str) -> List[Dict[str, str]]:
     return conversation_store.get(user_id, [])
@@ -223,50 +268,36 @@ def get_user_history(user_id: str) -> List[Dict[str, str]]:
 
 def append_to_history(user_id: str, user_msg: str, assistant_msg: str) -> None:
     history = conversation_store.get(user_id, [])
-
     history.append({"role": "user", "content": user_msg})
     history.append({"role": "assistant", "content": assistant_msg})
-
-    # Cắt bớt cho gọn (tính cả user + assistant)
     if len(history) > MAX_HISTORY_MESSAGES:
         history = history[-MAX_HISTORY_MESSAGES:]
-
     conversation_store[user_id] = history
 
 
 def history_to_short_text(history: List[Dict[str, str]], max_chars: int = 800) -> str:
-    """
-    Ghép history (user + assistant) thành 1 đoạn text ngắn cho agent tham chiếu.
-    """
     texts = []
-    for m in history[-8:]:  # chỉ lấy vài lượt gần nhất
+    for m in history[-8:]:
         role = m["role"]
         prefix = "User: " if role == "user" else "Assistant: "
         texts.append(prefix + m["content"])
     joined = "\n".join(texts)
-    if len(joined) > max_chars:
-        return joined[-max_chars:]
-    return joined
+    return joined[-max_chars:] if len(joined) > max_chars else joined
 
 # -------------------------------------------------
-# 5b. Ngôn ngữ: detect đơn giản VI / EN / ZH
+# 7. Simple language detection
 # -------------------------------------------------
 def detect_language(text: str) -> str:
-    """
-    Phát hiện rất đơn giản:
-    - Nếu có ký tự Trung (CJK) -> 'zh'
-    - Nếu có nhiều dấu tiếng Việt hoặc từ khóa phổ biến -> 'vi'
-    - Ngược lại -> 'en'
-    """
     # Chinese characters range
     for ch in text:
         if "\u4e00" <= ch <= "\u9fff":
             return "zh"
 
     vi_keywords = [
-        " không ", " ko ", "k nữa", "nhưng", "vì", "nên",
-        "em ", "anh ", "chị ", "cảm", "buồn", "lo ", "lo lắng",
-        "căng thẳng", "mệt", "bạn bè", "trường", "đại học",
+        " không ", " ko ", "nhưng", "vì", "nên",
+        "em ", "anh ", "chị ", "cảm", "buồn", "lo ",
+        "lo lắng", "căng thẳng", "mệt", "bạn bè",
+        "trường", "đại học",
     ]
     vi_diacritics = "ăâđêôơưáàảãạấầẩẫậéèẻẽẹóòỏõọúùủũụýỳỷỹỵ"
 
@@ -277,13 +308,9 @@ def detect_language(text: str) -> str:
     return "en"
 
 # -------------------------------------------------
-# 6. Multi-agent helpers
+# 8. Agent helpers
 # -------------------------------------------------
 def run_emotion_agent(user_message: str, history_text: str) -> dict:
-    """
-    Gọi EMOTION_AGENT để phân tích cảm xúc, chủ đề, tóm tắt.
-    Trả về dict Python (đã parse từ JSON).
-    """
     messages = [
         {"role": "system", "content": EMOTION_AGENT_PROMPT},
         {
@@ -297,20 +324,16 @@ def run_emotion_agent(user_message: str, history_text: str) -> dict:
             ),
         },
     ]
-
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
         temperature=0.2,
         max_tokens=300,
     )
-
     raw = completion.choices[0].message.content.strip()
     try:
-        data = json.loads(raw)
-        return data
+        return json.loads(raw)
     except Exception:
-        # Nếu model trả về JSON lỗi, fallback đơn giản
         return {
             "primary_emotion": "unclear",
             "intensity": 5,
@@ -325,17 +348,10 @@ def run_coach_agent(
     emotion_info: dict,
     lang_code: str,
 ) -> str:
-    """
-    Gọi COACH_AGENT để soạn câu trả lời chính dựa trên phân tích cảm xúc
-    và ngôn ngữ đã detect.
-    """
     emotion_summary = json.dumps(emotion_info, ensure_ascii=False)
-
-    lang_name = {
-        "vi": "Vietnamese",
-        "en": "English",
-        "zh": "Chinese",
-    }.get(lang_code, "English")
+    lang_name = {"vi": "Vietnamese", "en": "English", "zh": "Chinese"}.get(
+        lang_code, "English"
+    )
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -360,22 +376,16 @@ def run_coach_agent(
             ),
         },
     ]
-
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
         temperature=0.6,
         max_tokens=900,
     )
-
-    reply = completion.choices[0].message.content.strip()
-    return reply
+    return completion.choices[0].message.content.strip()
 
 
 def run_safety_agent(user_message: str, drafted_reply: str) -> dict:
-    """
-    Gọi SAFETY_AGENT để kiểm tra nguy cơ.
-    """
     messages = [
         {"role": "system", "content": SAFETY_AGENT_PROMPT},
         {
@@ -389,20 +399,16 @@ def run_safety_agent(user_message: str, drafted_reply: str) -> dict:
             ),
         },
     ]
-
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
         temperature=0.2,
         max_tokens=300,
     )
-
     raw = completion.choices[0].message.content.strip()
     try:
-        data = json.loads(raw)
-        return data
+        return json.loads(raw)
     except Exception:
-        # Nếu parse lỗi, coi như không có nguy cơ
         return {
             "risk_level": "none",
             "should_override": False,
@@ -410,7 +416,7 @@ def run_safety_agent(user_message: str, drafted_reply: str) -> dict:
         }
 
 # -------------------------------------------------
-# 7. Health check
+# 9. Health endpoints
 # -------------------------------------------------
 @app.get("/")
 async def root():
@@ -422,54 +428,53 @@ async def health():
     return {"status": "healthy"}
 
 # -------------------------------------------------
-# 8. Main chat endpoint (có memory + đa ngôn ngữ)
+# 10. Main chat endpoint
 # -------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(payload: ChatRequest):
     try:
-        user_id = payload.user_id.strip() or "anonymous"
-        user_message = payload.message.strip()
+        user_id = (payload.user_id or "").strip() or "anonymous"
+        user_message = (payload.message or "").strip()
+        condition = (payload.condition or "").strip() or None
 
         if not user_message:
             raise HTTPException(status_code=400, detail="Message must not be empty.")
 
-        # Detect language của message
         lang_code = detect_language(user_message)
-
-        # Lấy lịch sử hội thoại của user
         history = get_user_history(user_id)
-
-        # Tạo bản tóm tắt ngắn từ history cho agent dùng
         history_text = history_to_short_text(history)
 
-        # ---------- Agent 1: Emotion Analyzer ----------
         emotion_info = run_emotion_agent(user_message, history_text)
-
-        # ---------- Agent 2: Wellbeing Coach ----------
         drafted_reply = run_coach_agent(
             user_message=user_message,
             history_text=history_text,
             emotion_info=emotion_info,
             lang_code=lang_code,
         )
-
-        # ---------- Agent 3: Safety & Risk Check ----------
         safety_info = run_safety_agent(user_message, drafted_reply)
 
         final_reply = drafted_reply
-
         risk_level = safety_info.get("risk_level", "none")
         should_override = safety_info.get("should_override", False)
-        safety_message = safety_info.get("safety_message", "").strip()
+        safety_message = (safety_info.get("safety_message") or "").strip()
 
         if should_override and safety_message:
             final_reply = safety_message
-        else:
-            if risk_level in ("moderate", "high") and safety_message:
-                final_reply = drafted_reply + "\n\n" + safety_message
+        elif risk_level in ("moderate", "high") and safety_message:
+            final_reply = drafted_reply + "\n\n" + safety_message
 
-        # Lưu lại vào history
         append_to_history(user_id, user_message, final_reply)
+
+        # log vào DB cho nghiên cứu
+        log_interaction(
+            user_id=user_id,
+            condition=condition,
+            lang_code=lang_code,
+            user_message=user_message,
+            assistant_reply=final_reply,
+            emotion_info=emotion_info,
+            safety_info=safety_info,
+        )
 
         return ChatResponse(reply=final_reply)
 
