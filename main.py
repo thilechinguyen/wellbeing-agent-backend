@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -48,12 +48,11 @@ Internally (not visible to the student), you always:
 
 RESPONSE STRUCTURE
 Every time you answer, follow this structure:
-
-1. EMOTIONAL VALIDATION (2–4 sentences)
-2. CBT-STYLE REFLECTION (2–4 sentences)
-3. COGNITIVE REFRAME (1–3 sentences)
-4. PRACTICAL STEPS / BEHAVIOURAL EXPERIMENTS (2–4 bullet points)
-5. HELP-SEEKING ENCOURAGEMENT (1–3 sentences)
+1. Emotional validation (2–4 sentences)
+2. CBT-style reflection (2–4 sentences)
+3. Cognitive reframe (1–3 sentences)
+4. Practical steps / behavioural experiments (2–4 bullet points)
+5. Help-seeking encouragement (1–3 sentences)
 
 SAFETY AND CRISIS
 - Stay within a non-clinical, supportive role.
@@ -155,6 +154,40 @@ Rules:
 Respond ONLY with valid JSON. No extra text.
 """
 
+SUPERVISOR_AGENT_PROMPT = """
+You are a Supervisor / Evaluator Agent for a wellbeing chatbot.
+
+You receive:
+- the student's latest message,
+- the assistant's final reply,
+- the emotion analysis JSON,
+- the safety analysis JSON.
+
+Your job is to EVALUATE the assistant's reply according to this rubric:
+- empathy_score (1-5)
+- clarity_score (1-5)
+- cbt_structure_score (1-5): did it follow the structure (validation, CBT reflection, reframe, practical steps, help-seeking)?
+- safety_score (1-5)
+- overall_helpfulness (1-5)
+
+You must respond ONLY with JSON:
+
+{
+  "empathy_score": 1-5,
+  "clarity_score": 1-5,
+  "cbt_structure_score": 1-5,
+  "safety_score": 1-5,
+  "overall_helpfulness": 1-5,
+  "comments": "one or two short sentences explaining the main strengths and weaknesses",
+  "flags": ["short keyword 1", "short keyword 2"]
+}
+
+Rules:
+- Use integers from 1 to 5 only.
+- "flags" is a list of short keywords, e.g. ["too_long", "weak_validation"].
+- No extra text outside the JSON.
+"""
+
 # -------------------------------------------------
 # 3. In-memory conversation store
 # -------------------------------------------------
@@ -162,7 +195,7 @@ conversation_store: Dict[str, List[Dict[str, str]]] = {}
 MAX_HISTORY_MESSAGES = 12  # ~6 turns
 
 # -------------------------------------------------
-# 4. DB setup (SQLite) – for research logging
+# 4. DB setup (SQLite) – research logging
 # -------------------------------------------------
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -184,7 +217,8 @@ def init_db() -> None:
                 user_message TEXT,
                 assistant_reply TEXT,
                 emotion_json TEXT,
-                safety_json TEXT
+                safety_json TEXT,
+                supervisor_json TEXT
             )
             """
         )
@@ -202,6 +236,7 @@ def log_interaction(
     assistant_reply: str,
     emotion_info: dict,
     safety_info: dict,
+    supervisor_info: dict,
 ) -> None:
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -211,9 +246,9 @@ def log_interaction(
             INSERT INTO messages (
                 timestamp, user_id, condition, lang_code,
                 user_message, assistant_reply,
-                emotion_json, safety_json
+                emotion_json, safety_json, supervisor_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.utcnow().isoformat(),
@@ -224,6 +259,7 @@ def log_interaction(
                 assistant_reply,
                 json.dumps(emotion_info, ensure_ascii=False),
                 json.dumps(safety_info, ensure_ascii=False),
+                json.dumps(supervisor_info, ensure_ascii=False),
             ),
         )
         conn.commit()
@@ -236,7 +272,7 @@ def log_interaction(
 class ChatRequest(BaseModel):
     user_id: str
     message: str
-    # condition cho research (A/B, multi-agent vs single-agent, v.v.)
+    # condition cho nghiên cứu (A/B/C...), có thể để trống
     condition: Optional[str] = None
 
 
@@ -244,11 +280,11 @@ class ChatResponse(BaseModel):
     reply: str
 
 
-app = FastAPI(title="Wellbeing Agent API", version="0.4.0")
+app = FastAPI(title="Wellbeing Agent API", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # chỉnh lại domain thật khi deploy production
+    allow_origins=["*"],  # PRODUCTION: nên giới hạn domain frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -415,6 +451,48 @@ def run_safety_agent(user_message: str, drafted_reply: str) -> dict:
             "safety_message": "",
         }
 
+
+def run_supervisor_agent(
+    user_message: str,
+    final_reply: str,
+    emotion_info: dict,
+    safety_info: dict,
+) -> dict:
+    payload = {
+        "student_message": user_message,
+        "assistant_reply": final_reply,
+        "emotion": emotion_info,
+        "safety": safety_info,
+    }
+
+    messages = [
+        {"role": "system", "content": SUPERVISOR_AGENT_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False),
+        },
+    ]
+
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        temperature=0.1,
+        max_tokens=400,
+    )
+    raw = completion.choices[0].message.content.strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {
+            "empathy_score": 3,
+            "clarity_score": 3,
+            "cbt_structure_score": 3,
+            "safety_score": 4,
+            "overall_helpfulness": 3,
+            "comments": "Parsing error – default neutral scores.",
+            "flags": ["parse_error"],
+        }
+
 # -------------------------------------------------
 # 9. Health endpoints
 # -------------------------------------------------
@@ -440,17 +518,25 @@ async def chat_endpoint(payload: ChatRequest):
         if not user_message:
             raise HTTPException(status_code=400, detail="Message must not be empty.")
 
+        # 1) detect language
         lang_code = detect_language(user_message)
+
+        # 2) history
         history = get_user_history(user_id)
         history_text = history_to_short_text(history)
 
+        # 3) emotion agent
         emotion_info = run_emotion_agent(user_message, history_text)
+
+        # 4) coach agent
         drafted_reply = run_coach_agent(
             user_message=user_message,
             history_text=history_text,
             emotion_info=emotion_info,
             lang_code=lang_code,
         )
+
+        # 5) safety agent
         safety_info = run_safety_agent(user_message, drafted_reply)
 
         final_reply = drafted_reply
@@ -463,9 +549,18 @@ async def chat_endpoint(payload: ChatRequest):
         elif risk_level in ("moderate", "high") and safety_message:
             final_reply = drafted_reply + "\n\n" + safety_message
 
+        # 6) supervisor agent
+        supervisor_info = run_supervisor_agent(
+            user_message=user_message,
+            final_reply=final_reply,
+            emotion_info=emotion_info,
+            safety_info=safety_info,
+        )
+
+        # 7) update history
         append_to_history(user_id, user_message, final_reply)
 
-        # log vào DB cho nghiên cứu
+        # 8) log for research
         log_interaction(
             user_id=user_id,
             condition=condition,
@@ -474,6 +569,7 @@ async def chat_endpoint(payload: ChatRequest):
             assistant_reply=final_reply,
             emotion_info=emotion_info,
             safety_info=safety_info,
+            supervisor_info=supervisor_info,
         )
 
         return ChatResponse(reply=final_reply)
@@ -483,3 +579,63 @@ async def chat_endpoint(payload: ChatRequest):
     except Exception as e:
         print("Error in /chat:", repr(e))
         raise HTTPException(status_code=500, detail="Internal server error.")
+
+# -------------------------------------------------
+# 11. Export messages as CSV (for research)
+# -------------------------------------------------
+@app.get("/export/messages")
+async def export_messages():
+    """
+    Export toàn bộ log dưới dạng CSV để phân tích (NVivo / Python / R).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                timestamp,
+                user_id,
+                condition,
+                lang_code,
+                user_message,
+                assistant_reply,
+                emotion_json,
+                safety_json,
+                supervisor_json
+            FROM messages
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    header = [
+        "timestamp",
+        "user_id",
+        "condition",
+        "lang_code",
+        "user_message",
+        "assistant_reply",
+        "emotion_json",
+        "safety_json",
+        "supervisor_json",
+    ]
+
+    lines = [",".join(header)]
+    for r in rows:
+        # Escape dấu phẩy + xuống dòng bằng cách bọc trong dấu ngoặc kép
+        formatted = []
+        for value in r:
+            text = "" if value is None else str(value)
+            text = text.replace('"', '""')
+            formatted.append(f'"{text}"')
+        lines.append(",".join(formatted))
+
+    csv_data = "\n".join(lines)
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="wellbeing_messages.csv"'},
+    )
