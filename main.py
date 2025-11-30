@@ -1,225 +1,263 @@
 import os
-from typing import Optional, Dict, Any
+import io
+import csv
+from datetime import datetime
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from groq import Groq
-from dotenv import load_dotenv
 
-# ---------------------------------------------------------
-# 1. Load env & init Groq
-# ---------------------------------------------------------
-load_dotenv()
+from groq import Groq
+
+
+# =========================
+# 1. ENV & GROQ CLIENT
+# =========================
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not set in environment or .env file")
 
+# Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ---------------------------------------------------------
-# 2. FastAPI app + CORS
-# ---------------------------------------------------------
-app = FastAPI(title="Wellbeing Agent – Groq backend v0.7")
+# Model Groq đang hoạt động (tránh model đã bị decommission)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "deepseek-r1-distill-qwen-32b")
 
-allow_origins = os.getenv("ALLOW_ORIGINS", "*")
-origins = [o.strip() for o in allow_origins.split(",")] if allow_origins else ["*"]
+
+# =========================
+# 2. FASTAPI APP & CORS
+# =========================
+
+app = FastAPI(
+    title="Wellbeing Companion Backend",
+    description="Multi-agent style CBT wellbeing chatbot for first-year students.",
+    version="0.7",
+)
+
+# CORS
+allow_origins_env = os.getenv("ALLOW_ORIGINS", "")
+if allow_origins_env.strip():
+    ALLOW_ORIGINS = [o.strip() for o in allow_origins_env.split(",") if o.strip()]
+else:
+    ALLOW_ORIGINS = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------
-# 3. Pydantic models
-# ---------------------------------------------------------
+
+# =========================
+# 3. DATA MODELS
+# =========================
+
 class ChatRequest(BaseModel):
-    message: str
-    language: Optional[str] = "vi"
     user_id: Optional[str] = None
-    student_type: Optional[str] = None
-    student_region: Optional[str] = None
+    message: str
+
+    # metadata từ UI
+    student_type: Optional[str] = None  # e.g. "Domestic (Australia)", "International – SE Asia"
+    student_region: Optional[str] = None  # e.g. "Australia", "Vietnam"
+    language: Optional[str] = "vi"  # "vi" hoặc "en"
 
 
 class ChatResponse(BaseModel):
     reply: str
-    language: str
-    debug: Dict[str, Any]
+    model: str
+    meta: Dict[str, Any]
 
 
-# ---------------------------------------------------------
-# 4. System prompts cho từng agent
-# ---------------------------------------------------------
-EMOTION_SYSTEM_PROMPT = """
-You are an emotion detection assistant for first-year university students.
-Your job is to label the student's main emotional tone and give a one-sentence
-explanation. Answer in JSON with keys: emotion_label, explanation.
+class MessageLog(BaseModel):
+    timestamp: str
+    user_id: Optional[str]
+    student_type: Optional[str]
+    student_region: Optional[str]
+    language: Optional[str]
+    user_message: str
+    assistant_reply: str
+    model: str
+
+
+# Bộ nhớ tạm để log hội thoại (mất khi restart, nhưng đủ để demo /export/messages)
+MESSAGE_LOGS: List[MessageLog] = []
+
+
+# =========================
+# 4. SYSTEM PROMPT (multi-agent style)
+# =========================
+
+BASE_SYSTEM_PROMPT = """
+You are a CBT-informed wellbeing companion for first-year university students.
+
+Your job:
+- Listen with empathy.
+- Reflect feelings and normalise the experience.
+- Offer gentle, practical CBT-style strategies (thought reframing, problem solving, behavioural activation).
+- Always stay within a **supportive, non-clinical** role (you are NOT a therapist).
+- Encourage help-seeking: friends, family, student support, counsellors, emergency services when needed.
+- Be culturally sensitive to both Vietnamese and international students studying in Australia.
+
+Structure your reply in 3 short parts:
+1) Empathic reflection (1–2 câu ngắn, có thể dùng song ngữ Anh–Việt nếu phù hợp).
+2) Gợi ý cụ thể 2–3 bước nhỏ mà sinh viên có thể thử ngay (có thể gợi ý kiểu CBT).
+3) Nhắc nhẹ về nguồn hỗ trợ (bạn bè, gia đình, dịch vụ hỗ trợ sinh viên, counsellor, emergency nếu nguy hiểm).
+
+Safety rules:
+- Nếu người dùng nhắc tới tự hại bản thân, tự tử, bạo lực, lạm dụng hoặc nguy cơ an toàn nghiêm trọng,
+  hãy:
+  (a) Phản hồi rất nghiêm túc và đồng cảm.
+  (b) Khuyến khích họ liên hệ ngay với dịch vụ khẩn cấp tại quốc gia của họ (ví dụ: 000 ở Úc) hoặc tới bệnh viện gần nhất.
+  (c) Khuyến khích liên hệ dịch vụ counselling / đường dây nóng tại trường hoặc quốc gia của họ.
+  (d) Không đưa hướng dẫn cụ thể gây hại.
+
+Always use a warm, clear and simple tone. 
+If the student writes mostly in Vietnamese, ưu tiên trả lời bằng tiếng Việt (kèm 1–2 câu tiếng Anh đơn giản nếu phù hợp).
+If they write in English, trả lời chủ yếu bằng tiếng Anh, có thể xen 1–2 câu tiếng Việt giản dị để tạo cảm giác gần gũi.
 """
 
-COACH_SYSTEM_PROMPT = """
-You are a gentle CBT-informed wellbeing coach for first-year university students.
-Respond in a short, warm, practical way. Use simple language, max ~180 words.
-If the input language is Vietnamese, reply in natural Vietnamese.
-If English, reply in natural English.
-You can suggest 2–3 small next steps and one reflective question.
-Avoid clinical language and diagnosis.
-"""
 
-SAFETY_SYSTEM_PROMPT = """
-You are a safety checker. You ONLY decide if the message needs escalation.
-Return JSON with keys:
-- needs_urgent_help: true/false
-- reason: short text
-Flag true if there is self-harm, suicide, serious harm to others, or abuse.
-Otherwise false.
-"""
+def build_system_prompt(req: ChatRequest) -> str:
+    profile_info = f"Student type: {req.student_type or 'Unknown'}; " \
+                   f"Region: {req.student_region or 'Unknown'}; " \
+                   f"Language preference: {req.language or 'vi'}."
 
-AGGREGATOR_SYSTEM_PROMPT = """
-You are the final wellbeing companion talking directly to the student.
-You receive:
-- the student's original message
-- an emotion analysis
-- a draft coaching reply
-- a safety flag
-
-Your task:
-1. Keep the supportive tone of the coaching reply.
-2. Briefly acknowledge the detected emotion.
-3. If safety.needs_urgent_help is true, add a short, clear note encouraging
-   the student to reach out to professional or emergency services, but do NOT
-   panic or sound alarmist.
-4. Answer in the same LANGUAGE as the student's message (Vietnamese or English).
-
-Return ONLY the final message text, no JSON.
-"""
-
-# ---------------------------------------------------------
-# 5. Helper: gọi Groq model
-# ---------------------------------------------------------
-def groq_chat(system_prompt: str, user_prompt: str, model: str = "deepseek-r1-distill-llama-70b") -> str:
-    completion = groq_client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.6,
-        max_tokens=800,
-    )
-    return completion.choices[0].message.content.strip()
+    return BASE_SYSTEM_PROMPT + "\n\nExtra context about this student:\n" + profile_info
 
 
-# ---------------------------------------------------------
-# 6. Agents
-# ---------------------------------------------------------
-def run_emotion_agent(message: str) -> Dict[str, Any]:
-    raw = groq_chat(EMOTION_SYSTEM_PROMPT, message)
-    # cố gắng parse JSON nhưng nếu lỗi thì trả thẳng text
-    import json
+# =========================
+# 5. GROQ CALL WRAPPER
+# =========================
+
+def call_groq(req: ChatRequest) -> str:
+    """
+    Gọi Groq để sinh câu trả lời. Nếu lỗi thì raise HTTPException 500.
+    """
+    system_prompt = build_system_prompt(req)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": req.message.strip(),
+        },
+    ]
 
     try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {"emotion_label": "unknown", "explanation": raw}
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        content = completion.choices[0].message.content
+        if not content:
+            raise ValueError("Empty response from Groq")
+        return content
+    except Exception as e:
+        # Đưa error vào log server, và trả HTTP 500 cho frontend
+        print(f"[ERROR] Groq completion failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Wellbeing agent is temporarily unavailable. Please try again later."
+        )
 
 
-def run_coach_agent(message: str, language: str) -> str:
-    user_prompt = f"Language: {language}\nStudent message: {message}"
-    return groq_chat(COACH_SYSTEM_PROMPT, user_prompt)
+# =========================
+# 6. ENDPOINTS
+# =========================
 
-
-def run_safety_agent(message: str) -> Dict[str, Any]:
-    import json
-
-    raw = groq_chat(SAFETY_SYSTEM_PROMPT, message)
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {"needs_urgent_help": False, "reason": raw}
-
-
-def run_aggregator(
-    original_message: str,
-    language: str,
-    emotion: Dict[str, Any],
-    coach_reply: str,
-    safety: Dict[str, Any],
-) -> str:
-    summary_prompt = f"""
-Student language: {language}
-Original message:
-{original_message}
-
-Emotion analysis (JSON):
-{emotion}
-
-Draft coaching reply:
-{coach_reply}
-
-Safety check result (JSON):
-{safety}
-"""
-    return groq_chat(AGGREGATOR_SYSTEM_PROMPT, summary_prompt)
-
-
-# ---------------------------------------------------------
-# 7. Routes
-# ---------------------------------------------------------
 @app.get("/health")
-def health():
-    return {"status": "ok", "model": "groq-deepseek-v0.7"}
+async def health():
+    return {"status": "ok", "model": GROQ_MODEL}
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    try:
-        message = req.message.strip()
-        if not message:
-            raise HTTPException(status_code=400, detail="Empty message")
+async def chat(req: ChatRequest):
+    """
+    Endpoint chính cho UI.
+    """
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message must not be empty.")
 
-        language = (req.language or "vi").lower()
+    reply = call_groq(req)
 
-        # 1) Emotion
-        emotion = run_emotion_agent(message)
+    # Log lại hội thoại
+    log_entry = MessageLog(
+        timestamp=datetime.utcnow().isoformat(),
+        user_id=req.user_id,
+        student_type=req.student_type,
+        student_region=req.student_region,
+        language=req.language,
+        user_message=req.message,
+        assistant_reply=reply,
+        model=GROQ_MODEL,
+    )
+    MESSAGE_LOGS.append(log_entry)
 
-        # 2) Coaching
-        coach_reply = run_coach_agent(message, language)
+    return ChatResponse(
+        reply=reply,
+        model=GROQ_MODEL,
+        meta={
+            "student_type": req.student_type,
+            "student_region": req.student_region,
+            "language": req.language,
+        },
+    )
 
-        # 3) Safety
-        safety = run_safety_agent(message)
 
-        # 4) Aggregator
-        final_reply = run_aggregator(
-            original_message=message,
-            language=language,
-            emotion=emotion,
-            coach_reply=coach_reply,
-            safety=safety,
-        )
+@app.get("/export/messages")
+async def export_messages():
+    """
+    Xuất toàn bộ MESSAGE_LOGS thành file CSV.
+    UI đang gọi /export/messages nên giữ endpoint này.
+    """
 
-        return ChatResponse(
-            reply=final_reply,
-            language=language,
-            debug={
-                "emotion": emotion,
-                "coach": coach_reply,
-                "safety": safety,
-            },
-        )
+    output = io.StringIO()
+    writer = csv.writer(output)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        # log cho Render
-        print("Error in /chat:", repr(e))
-        raise HTTPException(status_code=500, detail="Internal error in wellbeing agent")
+    # Header
+    writer.writerow([
+        "timestamp",
+        "user_id",
+        "student_type",
+        "student_region",
+        "language",
+        "user_message",
+        "assistant_reply",
+        "model",
+    ])
+
+    for log in MESSAGE_LOGS:
+        writer.writerow([
+            log.timestamp,
+            log.user_id or "",
+            log.student_type or "",
+            log.student_region or "",
+            log.language or "",
+            log.user_message.replace("\n", " ").strip(),
+            log.assistant_reply.replace("\n", " ").strip(),
+            log.model,
+        ])
+
+    output.seek(0)
+    headers = {
+        "Content-Disposition": 'attachment; filename="wellbeing_messages.csv"'
+    }
+    return StreamingResponse(output, media_type="text/csv", headers=headers)
+
+
+# =========================
+# 7. LOCAL DEV ENTRYPOINT
+# =========================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
