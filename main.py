@@ -1,59 +1,32 @@
 import os
 import json
-import io
 import csv
-from datetime import datetime, timezone
-from typing import Dict, List, Any
+import io
+from datetime import datetime
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import requests
+from groq import Groq
 
 # -------------------------------------------------
-# 1. Load environment & init Groq client (OpenAI-compatible)
+# 1. Load .env & init Groq client (DeepSeek qua Groq)
 # -------------------------------------------------
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
+groq_api_key = os.getenv("GROQ_API_KEY")
+if not groq_api_key:
     raise RuntimeError("GROQ_API_KEY is not set in environment or .env file")
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-70b-versatile"
+groq_client = Groq(api_key=groq_api_key)
 
-
-def groq_chat(messages: List[Dict[str, str]],
-              temperature: float = 0.6,
-              max_tokens: int = 800) -> str:
-    """
-    Helper function to call Groq in OpenAI-compatible chat format.
-    """
-    try:
-        resp = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=40,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print("Groq error:", repr(e))
-        raise HTTPException(status_code=500, detail="LLM engine error (Groq)." )
-
+# Chọn model Groq (DeepSeek distill – miễn phí / tốc độ cao)
+GROQ_MODEL = "deepseek-r1-distill-llama-70b"
 
 # -------------------------------------------------
-# 2. System prompt CBT + wellbeing + Uni of Adelaide (giữ bản gốc)
-#    (hiện tại không dùng trực tiếp, nhưng giữ lại để tái sử dụng sau)
+# 2. System prompts cho các agent
 # -------------------------------------------------
 SYSTEM_PROMPT = """
 You are a friendly, non-clinical, CBT-informed wellbeing companion for first-year university students.
@@ -90,7 +63,8 @@ Every time you answer, follow this structure:
 
 4. PRACTICAL STEPS / BEHAVIOURAL EXPERIMENTS
    - Provide a bullet list of 2–4 concrete actions they can try in the next 24–72 hours.
-   - Make these actions very small, realistic, and specific (e.g., 'write down your main worry and one alternative explanation', 'send one message to a classmate', 'take a 5-minute walk and notice your breathing').
+   - Make these actions very small, realistic, and specific (e.g., "write down your main worry and one alternative explanation",
+     "send one message to a classmate", "take a 5-minute walk and notice your breathing").
 
 5. HELP-SEEKING ENCOURAGEMENT
    - End with 1–3 sentences gently encouraging them to talk to supportive people (friends, family, mentors, university services).
@@ -112,67 +86,31 @@ then you MUST:
 - Keep your message short, calm, supportive, and focused on helping them reach real-world support.
 - Avoid giving detailed instructions or advice on self-harm or suicide.
 
-ADDITIONAL SUPPORT INFORMATION
+ADDITIONAL SUPPORT INFORMATION (University of Adelaide)
 If the student expresses a need for help, you may refer them to:
-- The University of Adelaide Student Health & Wellbeing website: https://www.adelaide.edu.au/student/wellbeing/
-  This site contains self-help resources, tips for stress, anxiety, exam support and more.
+- The University of Adelaide Student Health & Wellbeing website:
+  https://www.adelaide.edu.au/student/wellbeing/
 - The University of Adelaide Counselling Service (Wellbeing Hub):
     Phone: +61 8 8313 5663
     Email: counselling.centre@adelaide.edu.au
-- The University of Adelaide Support for Students page: https://www.adelaide.edu.au/student/support/
-
-You should encourage the student with a sentence like:
-'If you feel your wellbeing is seriously affected or you think you need to talk to someone, you can visit these links or contact the counselling centre. You are not alone.'
-
-UNIVERSITY-SPECIFIC SUPPORT (IMPORTANT)
-When the student mentions difficulties related to:
-- tuition fees,
-- overdue payments,
-- financial stress,
-- money worries,
-- visa concerns tied to payments,
-- or challenges specific to international students,
-
-you may gently guide them to official support channels from the University of Adelaide. Do not force referrals; offer them as helpful options.
-
-Use the following verified information:
-
-1. FINANCIAL SUPPORT (Domestic + International Students)
-   - Financial hardship support, payment plan options, grants and emergency assistance:
-     https://www.adelaide.edu.au/student/finance/
-   - Student finance enquiries email:
-     studentfinance@adelaide.edu.au
-
-2. INTERNATIONAL STUDENT SUPPORT
-   - International Student Support homepage:
-     https://www.adelaide.edu.au/student/international/
-   - Contact email:
-     iss@adelaide.edu.au
-   - Support includes: enrolment issues, CoE/visa concerns, wellbeing support, financial difficulties, and navigating university processes.
+- The University of Adelaide Support for Students page:
+  https://www.adelaide.edu.au/student/support/
 
 When referring to these services:
 - keep a warm, supportive tone,
 - do not imply that the student must contact them,
-- frame it as 'you might find it helpful to reach out…',
+- frame it as "you might find it helpful to reach out…",
 - remind them they are not alone and help is available.
 
-Do NOT give legal or migration advice. Refer students only to official university services or to Migration Agents where appropriate.
+Do NOT give legal or migration advice. Refer students only to official university services
+or to Migration Agents where appropriate.
 
-If the student shows severe distress (e.g., panic, extreme overwhelm):
-- acknowledge feelings first,
-- then offer these support options as possible next steps.
-
-STYLE
-- Use warm, simple, non-judgemental language.
-- Avoid clinical terminology and diagnoses.
-- Do not talk about CBT theory explicitly unless the student asks. Show CBT through your questions and suggestions.
-- Keep answers focused and not too long (about 3–6 short paragraphs plus bullets).
+LANGUAGE
+- Always reply in the same language that the student uses in their latest message.
+- If the language looks Vietnamese, answer in Vietnamese.
+- If the language looks English, answer in English.
+- If the language looks Chinese, answer in Chinese.
 """
-
-
-# -------------------------------------------------
-# 2b. System prompt cho từng AGENT (bản multi-agent cũ của ông)
-# -------------------------------------------------
 
 EMOTION_AGENT_PROMPT = """
 You are an Emotion & Theme Analyzer for a wellbeing chatbot.
@@ -196,13 +134,15 @@ You are the main CBT-informed wellbeing companion for first-year university stud
 You receive:
 - the student's latest message,
 - an emotion analysis (primary emotion, intensity, topics, summary),
-- some short context from the conversation so far.
+- some short context from the conversation so far,
+- optional metadata about the student's profile (e.g., domestic/international, region).
 
 Your job:
-- Follow the RESPONSE STRUCTURE from the main SYSTEM_PROMPT (validation, CBT reflection, reframe, practical steps, help-seeking).
+- Follow the RESPONSE STRUCTURE from the main SYSTEM_PROMPT
+  (validation, CBT reflection, reframe, practical steps, help-seeking).
 - Keep the tone warm, gentle, non-clinical.
-- You can use bullet points for practical steps.
-- You can respond in the same language that the student uses (Vietnamese, English, or Chinese), based on their latest message.
+- IMPORTANT: Respond in the SAME LANGUAGE as the student's latest message
+  (Vietnamese, English, or Chinese).
 
 Output:
 - A natural language reply to the student (no JSON), ready to be sent.
@@ -232,48 +172,76 @@ Your job:
 }
 
 Rules:
-- If risk_level == "none": 
+- If risk_level == "none":
     - should_override = false
     - safety_message can be an empty string "".
 - If risk_level == "moderate":
     - should_override = false
-    - safety_message = 1–3 sentences gently encouraging them to seek support (friends, family, university counselling, but not emergency).
+    - safety_message = 1–3 sentences gently encouraging them to seek support
+      (friends, family, university counselling, but not emergency).
 - If risk_level == "high":
     - should_override = true
-    - safety_message = a short, clear message saying the bot is not a crisis service and they must reach emergency services or crisis hotlines immediately.
+    - safety_message = a short, clear message saying the bot is not a crisis service and
+      they must reach emergency services or crisis hotlines immediately.
 
 Respond ONLY with valid JSON. No extra text.
 """
 
-
 # -------------------------------------------------
-# 3. In-memory conversation store (per user) + research log
+# 3. In-memory conversation store + research log
 # -------------------------------------------------
 conversation_store: Dict[str, List[Dict[str, str]]] = {}
-MAX_HISTORY_MESSAGES = 12  # chỉ giữ ~6 lượt hỏi–đáp gần nhất
+MAX_HISTORY_MESSAGES = 12
 
-research_log: List[Dict[str, Any]] = []  # để export CSV cho nghiên cứu
+research_logs: List[Dict[str, str]] = []  # để export CSV nghiên cứu
+
+# -------------------------------------------------
+# 4. FastAPI models & app
+# -------------------------------------------------
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+    student_type: Optional[str] = None   # "Domestic (Australia)", "International – SE Asia", ...
+    student_region: Optional[str] = None # "Australia", "Vietnam", "Europe", ...
+    language: Optional[str] = None       # cho tương lai nếu muốn gửi riêng
 
 
+class ChatResponse(BaseModel):
+    reply: str
+
+
+app = FastAPI(
+    title="Wellbeing Agent API (Groq / DeepSeek)",
+    version="0.7.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev cho dễ, sau có thể khóa domain lại
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------------------------------
+# 5. Helpers
+# -------------------------------------------------
 def get_user_history(user_id: str) -> List[Dict[str, str]]:
     return conversation_store.get(user_id, [])
 
 
 def append_to_history(user_id: str, user_msg: str, assistant_msg: str) -> None:
     history = conversation_store.get(user_id, [])
-
     history.append({"role": "user", "content": user_msg})
     history.append({"role": "assistant", "content": assistant_msg})
-
     if len(history) > MAX_HISTORY_MESSAGES:
         history = history[-MAX_HISTORY_MESSAGES:]
-
     conversation_store[user_id] = history
 
 
 def history_to_short_text(history: List[Dict[str, str]], max_chars: int = 800) -> str:
     texts = []
-    for m in history[-8:]:  # chỉ lấy vài lượt gần nhất
+    for m in history[-8:]:
         role = m["role"]
         prefix = "User: " if role == "user" else "Assistant: "
         texts.append(prefix + m["content"])
@@ -283,120 +251,99 @@ def history_to_short_text(history: List[Dict[str, str]], max_chars: int = 800) -
     return joined
 
 
-# -------------------------------------------------
-# 4. Multi-agent helpers (Groq-based)
-# -------------------------------------------------
-def run_emotion_agent(user_message: str, history_text: str) -> dict:
+def call_groq_chat(messages: List[Dict[str, str]],
+                   temperature: float,
+                   max_tokens: int) -> str:
     """
-    Gọi EMOTION_AGENT để phân tích cảm xúc, chủ đề, tóm tắt.
+    Wrapper gọi Groq chat.completions.
     """
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return completion.choices[0].message.content.strip()
+
+
+def run_emotion_agent(user_message: str, history_text: str, profile_text: str) -> dict:
+    prompt_user = (
+        "Conversation context (short):\n"
+        f"{history_text}\n\n"
+        "Student profile:\n"
+        f"{profile_text}\n\n"
+        "Latest student message:\n"
+        f"{user_message}\n\n"
+        "Return JSON only."
+    )
     messages = [
         {"role": "system", "content": EMOTION_AGENT_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "Conversation context (short):\n"
-                f"{history_text}\n\n"
-                "Latest student message:\n"
-                f"{user_message}\n\n"
-                "Return JSON only."
-            ),
-        },
+        {"role": "user", "content": prompt_user},
     ]
+    raw = call_groq_chat(messages, temperature=0.2, max_tokens=300)
 
-    raw = groq_chat(messages, temperature=0.2, max_tokens=300)
     try:
         data = json.loads(raw)
         return data
     except Exception:
-        # Nếu model trả về JSON lỗi, fallback đơn giản
+        # fallback nếu JSON lỗi
         return {
             "primary_emotion": "unclear",
             "intensity": 5,
             "topics": [],
-            "summary": "Could not parse emotion JSON.",
+            "summary": "Could not parse emotion JSON."
         }
 
 
-def run_coach_agent(user_message: str, history_text: str, emotion_info: dict) -> str:
-    """
-    Gọi COACH_AGENT để soạn câu trả lời chính dựa trên phân tích cảm xúc.
-    """
+def run_coach_agent(
+    user_message: str,
+    history_text: str,
+    profile_text: str,
+    emotion_info: dict
+) -> str:
     emotion_summary = json.dumps(emotion_info, ensure_ascii=False)
-
+    prompt_user = (
+        "Conversation context (short):\n"
+        f"{history_text}\n\n"
+        "Student profile metadata:\n"
+        f"{profile_text}\n\n"
+        "Emotion analysis JSON:\n"
+        f"{emotion_summary}\n\n"
+        "Student's latest message:\n"
+        f"{user_message}\n\n"
+        "Now write a helpful CBT-informed reply following the structure."
+    )
     messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": COACH_AGENT_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "Conversation context (short):\n"
-                f"{history_text}\n\n"
-                "Emotion analysis JSON:\n"
-                f"{emotion_summary}\n\n"
-                "Student's latest message:\n"
-                f"{user_message}\n\n"
-                "Now write a helpful, CBT-informed reply following the structure."
-            ),
-        },
+        {"role": "user", "content": prompt_user},
     ]
-
-    reply = groq_chat(messages, temperature=0.6, max_tokens=900)
+    reply = call_groq_chat(messages, temperature=0.6, max_tokens=900)
     return reply
 
 
 def run_safety_agent(user_message: str, drafted_reply: str) -> dict:
-    """
-    Gọi SAFETY_AGENT để kiểm tra nguy cơ.
-    """
+    prompt_user = (
+        "Student's latest message:\n"
+        f"{user_message}\n\n"
+        "Draft assistant reply:\n"
+        f"{drafted_reply}\n\n"
+        "Return JSON only."
+    )
     messages = [
         {"role": "system", "content": SAFETY_AGENT_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "Student's latest message:\n"
-                f"{user_message}\n\n"
-                "Draft assistant reply:\n"
-                f"{drafted_reply}\n\n"
-                "Return JSON only."
-            ),
-        },
+        {"role": "user", "content": prompt_user},
     ]
-
-    raw = groq_chat(messages, temperature=0.2, max_tokens=300)
+    raw = call_groq_chat(messages, temperature=0.1, max_tokens=300)
     try:
         data = json.loads(raw)
         return data
     except Exception:
-        # Nếu parse lỗi, coi như không có nguy cơ
         return {
             "risk_level": "none",
             "should_override": False,
-            "safety_message": "",
+            "safety_message": ""
         }
-
-
-# -------------------------------------------------
-# 5. FastAPI models & app
-# -------------------------------------------------
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-
-
-class ChatResponse(BaseModel):
-    reply: str
-
-
-app = FastAPI(title="Wellbeing Agent API (Groq multi-agent)", version="0.5.0")
-
-# Cho phép gọi từ bất cứ frontend nào (tạm thời cho dev)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 # -------------------------------------------------
@@ -413,7 +360,7 @@ async def health():
 
 
 # -------------------------------------------------
-# 7. Main chat endpoint (có memory + logging nghiên cứu)
+# 7. Main chat endpoint
 # -------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(payload: ChatRequest):
@@ -424,23 +371,29 @@ async def chat_endpoint(payload: ChatRequest):
         if not user_message:
             raise HTTPException(status_code=400, detail="Message must not be empty.")
 
-        # Lấy lịch sử hội thoại của user
         history = get_user_history(user_id)
-
-        # Tạo bản tóm tắt ngắn từ history cho agent dùng
         history_text = history_to_short_text(history)
 
-        # ---------- Agent 1: Emotion Analyzer ----------
-        emotion_info = run_emotion_agent(user_message, history_text)
+        profile_text = (
+            f"student_type={payload.student_type or 'unknown'}, "
+            f"student_region={payload.student_region or 'unknown'}"
+        )
 
-        # ---------- Agent 2: Wellbeing Coach ----------
-        drafted_reply = run_coach_agent(user_message, history_text, emotion_info)
+        # -------- Agent 1: Emotion --------
+        emotion_info = run_emotion_agent(user_message, history_text, profile_text)
 
-        # ---------- Agent 3: Safety & Risk Check ----------
+        # -------- Agent 2: Coach --------
+        drafted_reply = run_coach_agent(
+            user_message=user_message,
+            history_text=history_text,
+            profile_text=profile_text,
+            emotion_info=emotion_info,
+        )
+
+        # -------- Agent 3: Safety --------
         safety_info = run_safety_agent(user_message, drafted_reply)
 
         final_reply = drafted_reply
-
         risk_level = safety_info.get("risk_level", "none")
         should_override = safety_info.get("should_override", False)
         safety_message = safety_info.get("safety_message", "").strip()
@@ -451,18 +404,20 @@ async def chat_endpoint(payload: ChatRequest):
             if risk_level in ("moderate", "high") and safety_message:
                 final_reply = drafted_reply + "\n\n" + safety_message
 
-        # Lưu lại vào history (cho体验 chat)
+        # Lưu history
         append_to_history(user_id, user_message, final_reply)
 
-        # Ghi log cho research
-        research_log.append(
+        # Log cho nghiên cứu
+        research_logs.append(
             {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.utcnow().isoformat(),
                 "user_id": user_id,
+                "student_type": payload.student_type or "",
+                "student_region": payload.student_region or "",
                 "user_message": user_message,
                 "assistant_reply": final_reply,
-                "emotion_info": emotion_info,
-                "safety_info": safety_info,
+                "emotion_json": json.dumps(emotion_info, ensure_ascii=False),
+                "risk_level": risk_level,
             }
         )
 
@@ -476,48 +431,45 @@ async def chat_endpoint(payload: ChatRequest):
 
 
 # -------------------------------------------------
-# 8. Export research log as CSV
+# 8. Export research logs (CSV)
 # -------------------------------------------------
 @app.get("/export/messages")
 async def export_messages():
     """
-    Trả về toàn bộ research_log dưới dạng CSV để tải về.
+    Xuất toàn bộ research_logs thành CSV để tải về.
     """
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
+    if not research_logs:
+        # vẫn trả file rỗng cho dễ xử lý
+        headers = ["timestamp", "user_id", "student_type", "student_region",
+                   "user_message", "assistant_reply", "emotion_json", "risk_level"]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=headers)
+        writer.writeheader()
+    else:
+        headers = list(research_logs[0].keys())
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=headers)
+        writer.writeheader()
+        for row in research_logs:
+            writer.writerow(row)
 
-    writer.writerow(
-        [
-            "timestamp",
-            "user_id",
-            "user_message",
-            "assistant_reply",
-            "primary_emotion",
-            "intensity",
-            "topics",
-            "risk_level",
-        ]
+    csv_bytes = buf.getvalue().encode("utf-8-sig")
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=wellbeing_messages.csv"},
     )
 
-    for row in research_log:
-        emo = row.get("emotion_info") or {}
-        safety = row.get("safety_info") or {}
-        writer.writerow(
-            [
-                row.get("timestamp", ""),
-                row.get("user_id", ""),
-                row.get("user_message", "").replace("\n", " "),
-                row.get("assistant_reply", "").replace("\n", " "),
-                emo.get("primary_emotion", ""),
-                emo.get("intensity", ""),
-                ", ".join(emo.get("topics", []) or []),
-                safety.get("risk_level", ""),
-            ]
-        )
 
-    buffer.seek(0)
-    return StreamingResponse(
-        buffer,
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=messages_log.csv"},
+# -------------------------------------------------
+# 9. Chạy local (python main.py)
+# -------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=10000,
+        reload=True,
     )
