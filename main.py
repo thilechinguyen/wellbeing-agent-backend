@@ -1,260 +1,244 @@
 import os
-import io
-import csv
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
 from groq import Groq
 
-
-# =========================
-# 1. ENV & GROQ CLIENT
-# =========================
+# =========================================================
+#  Cấu hình Groq client + model
+# =========================================================
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not set in environment or .env file")
 
-# Groq client
+# Model mặc định: llama-3.1-8b-instant (free, nhanh)
+GROQ_MODEL_ID = os.getenv("GROQ_MODEL_ID", "llama-3.1-8b-instant")
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Model Groq đang hoạt động (tránh model đã bị decommission)
-GROQ_MODEL = os.getenv("GROQ_MODEL", "deepseek-r1-distill-qwen-32b")
 
+# =========================================================
+#  System prompts cho 3 agents
+# =========================================================
 
-# =========================
-# 2. FASTAPI APP & CORS
-# =========================
+BASE_CONTEXT = """
+You are part of a CBT-based wellbeing multi-agent system that supports first-year university students.
+The student may be an international or domestic student, feeling lonely, stressed, or worried about study.
 
-app = FastAPI(
-    title="Wellbeing Companion Backend",
-    description="Multi-agent style CBT wellbeing chatbot for first-year students.",
-    version="0.7",
+General rules for ALL agents:
+- Be warm, validating, non-judgemental.
+- Write in clear, simple language.
+- If the user message is in Vietnamese, answer in Vietnamese.
+- If the user message is in English, answer in English.
+- Do NOT claim to be a therapist, doctor, or crisis service.
+- If there is any hint of self-harm or serious risk, gently encourage the student to reach out to:
+  - trusted people in their life, AND
+  - professional or emergency services in their country.
+"""
+
+EMOTION_SYSTEM_PROMPT = (
+    BASE_CONTEXT
+    + """
+You are the EMOTION agent.
+
+Your job:
+- Identify the student's key emotions and needs.
+- Reflect their feelings back with high empathy.
+- Name emotions explicitly (e.g. "lonely", "overwhelmed", "anxious", "homesick").
+- Keep it short: 3–5 sentences.
+
+Output format:
+- A short paragraph (NO bullet list).
+- No advice, no action plan yet. Just understanding and validation.
+"""
 )
 
-# CORS
-allow_origins_env = os.getenv("ALLOW_ORIGINS", "")
-if allow_origins_env.strip():
-    ALLOW_ORIGINS = [o.strip() for o in allow_origins_env.split(",") if o.strip()]
+COACH_SYSTEM_PROMPT = (
+    BASE_CONTEXT
+    + """
+You are the COACH agent.
+
+Your job:
+- Offer practical, CBT-informed support for the student's situation.
+- Use:
+  - gentle cognitive reframing,
+  - simple behavioural suggestions (small steps),
+  - self-compassion and growth mindset.
+- Tailor your response to first-year university students.
+- Avoid medical language or diagnosing.
+
+Output format:
+- 2–4 short paragraphs.
+- Very concrete and encouraging.
+- At the end, add 2–3 reflective questions the student could think about or journal about.
+"""
+)
+
+SAFETY_SYSTEM_PROMPT = (
+    BASE_CONTEXT
+    + """
+You are the SAFETY agent.
+
+Your job:
+- Scan the student's message for any risk of self-harm, suicide, or serious harm.
+- Be very sensitive but calm.
+- If there is ANY possible risk, you must:
+  - advise the student to contact local emergency services or crisis hotlines,
+  - encourage them to reach out to trusted people (friends, family, university support, counsellors),
+  - clearly state that online tools cannot handle emergencies.
+
+Output format:
+- 3–6 sentences.
+- Always include at least one sentence reminding the student that if they are in immediate danger,
+  they should contact emergency services in their country right away.
+"""
+)
+
+
+# =========================================================
+#  FastAPI app + CORS
+# =========================================================
+
+app = FastAPI(title="Wellbeing Agent – Groq Multi-Agent Backend")
+
+allow_origins_env = os.getenv("ALLOW_ORIGINS", "*")
+if allow_origins_env.strip() == "*":
+    origins = ["*"]
 else:
-    ALLOW_ORIGINS = ["*"]
+    origins = [origin.strip() for origin in allow_origins_env.split(",") if origin.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# =========================
-# 3. DATA MODELS
-# =========================
+# =========================================================
+#  Pydantic models
+# =========================================================
 
 class ChatRequest(BaseModel):
-    user_id: Optional[str] = None
     message: str
-
-    # metadata từ UI
-    student_type: Optional[str] = None  # e.g. "Domestic (Australia)", "International – SE Asia"
-    student_region: Optional[str] = None  # e.g. "Australia", "Vietnam"
-    language: Optional[str] = "vi"  # "vi" hoặc "en"
+    # metadata gửi từ frontend – để optional cho chắc
+    student_type: Optional[str] = None
+    student_region: Optional[str] = None
+    lang: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
+    # final message cho UI (UI đang dùng trường này)
     reply: str
-    model: str
-    meta: Dict[str, Any]
+
+    # thêm chi tiết 3 agents (UI có thể dùng sau này)
+    emotion: str
+    coach: str
+    safety: str
 
 
-class MessageLog(BaseModel):
-    timestamp: str
-    user_id: Optional[str]
-    student_type: Optional[str]
-    student_region: Optional[str]
-    language: Optional[str]
-    user_message: str
-    assistant_reply: str
-    model: str
+# =========================================================
+#  Hàm gọi Groq
+# =========================================================
 
-
-# Bộ nhớ tạm để log hội thoại (mất khi restart, nhưng đủ để demo /export/messages)
-MESSAGE_LOGS: List[MessageLog] = []
-
-
-# =========================
-# 4. SYSTEM PROMPT (multi-agent style)
-# =========================
-
-BASE_SYSTEM_PROMPT = """
-You are a CBT-informed wellbeing companion for first-year university students.
-
-Your job:
-- Listen with empathy.
-- Reflect feelings and normalise the experience.
-- Offer gentle, practical CBT-style strategies (thought reframing, problem solving, behavioural activation).
-- Always stay within a **supportive, non-clinical** role (you are NOT a therapist).
-- Encourage help-seeking: friends, family, student support, counsellors, emergency services when needed.
-- Be culturally sensitive to both Vietnamese and international students studying in Australia.
-
-Structure your reply in 3 short parts:
-1) Empathic reflection (1–2 câu ngắn, có thể dùng song ngữ Anh–Việt nếu phù hợp).
-2) Gợi ý cụ thể 2–3 bước nhỏ mà sinh viên có thể thử ngay (có thể gợi ý kiểu CBT).
-3) Nhắc nhẹ về nguồn hỗ trợ (bạn bè, gia đình, dịch vụ hỗ trợ sinh viên, counsellor, emergency nếu nguy hiểm).
-
-Safety rules:
-- Nếu người dùng nhắc tới tự hại bản thân, tự tử, bạo lực, lạm dụng hoặc nguy cơ an toàn nghiêm trọng,
-  hãy:
-  (a) Phản hồi rất nghiêm túc và đồng cảm.
-  (b) Khuyến khích họ liên hệ ngay với dịch vụ khẩn cấp tại quốc gia của họ (ví dụ: 000 ở Úc) hoặc tới bệnh viện gần nhất.
-  (c) Khuyến khích liên hệ dịch vụ counselling / đường dây nóng tại trường hoặc quốc gia của họ.
-  (d) Không đưa hướng dẫn cụ thể gây hại.
-
-Always use a warm, clear and simple tone. 
-If the student writes mostly in Vietnamese, ưu tiên trả lời bằng tiếng Việt (kèm 1–2 câu tiếng Anh đơn giản nếu phù hợp).
-If they write in English, trả lời chủ yếu bằng tiếng Anh, có thể xen 1–2 câu tiếng Việt giản dị để tạo cảm giác gần gũi.
-"""
-
-
-def build_system_prompt(req: ChatRequest) -> str:
-    profile_info = f"Student type: {req.student_type or 'Unknown'}; " \
-                   f"Region: {req.student_region or 'Unknown'}; " \
-                   f"Language preference: {req.language or 'vi'}."
-
-    return BASE_SYSTEM_PROMPT + "\n\nExtra context about this student:\n" + profile_info
-
-
-# =========================
-# 5. GROQ CALL WRAPPER
-# =========================
-
-def call_groq(req: ChatRequest) -> str:
+def call_groq_agent(system_prompt: str, user_message: str) -> str:
     """
-    Gọi Groq để sinh câu trả lời. Nếu lỗi thì raise HTTPException 500.
+    Gọi 1 agent Groq với system prompt riêng.
+    Trả về content của assistant (string).
     """
-    system_prompt = build_system_prompt(req)
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": req.message.strip(),
-        },
-    ]
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL_ID,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.7,
+        max_tokens=800,
+    )
 
     try:
-        completion = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=1024,
-        )
-        content = completion.choices[0].message.content
-        if not content:
-            raise ValueError("Empty response from Groq")
-        return content
-    except Exception as e:
-        # Đưa error vào log server, và trả HTTP 500 cho frontend
-        print(f"[ERROR] Groq completion failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Wellbeing agent is temporarily unavailable. Please try again later."
-        )
+        return completion.choices[0].message.content.strip()
+    except Exception as exc:  # phòng lỗi bất ngờ trong cấu trúc response
+        raise RuntimeError(f"Groq response parsing error: {exc}") from exc
 
 
-# =========================
-# 6. ENDPOINTS
-# =========================
+# =========================================================
+#  Endpoints
+# =========================================================
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "model": GROQ_MODEL}
+def health_check():
+    return {"status": "ok", "model": GROQ_MODEL_ID}
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    """
-    Endpoint chính cho UI.
-    """
-    if not req.message or not req.message.strip():
-        raise HTTPException(status_code=400, detail="Message must not be empty.")
+def chat_endpoint(payload: ChatRequest):
+    if not payload.message or not payload.message.strip():
+        raise HTTPException(status_code=400, detail="Message is required")
 
-    reply = call_groq(req)
+    user_text = payload.message.strip()
 
-    # Log lại hội thoại
-    log_entry = MessageLog(
-        timestamp=datetime.utcnow().isoformat(),
-        user_id=req.user_id,
-        student_type=req.student_type,
-        student_region=req.student_region,
-        language=req.language,
-        user_message=req.message,
-        assistant_reply=reply,
-        model=GROQ_MODEL,
-    )
-    MESSAGE_LOGS.append(log_entry)
+    # Thêm chút meta profile cho agents (nếu có)
+    profile_lines = []
+    if payload.student_type:
+        profile_lines.append(f"Student type: {payload.student_type}")
+    if payload.student_region:
+        profile_lines.append(f"Region: {payload.student_region}")
+    if payload.lang:
+        profile_lines.append(f"Preferred language code (if provided): {payload.lang}")
+    if payload.user_id:
+        profile_lines.append(f"User id (for context only, not for identification): {payload.user_id}")
+
+    profile_block = ""
+    if profile_lines:
+        profile_block = "\n\n[Profile]\n" + "\n".join(profile_lines)
+
+    full_user_message = user_text + profile_block
+
+    try:
+        # 3 agents chạy lần lượt (đơn giản, dễ debug; nếu muốn sau có thể chuyển sang async/gather)
+        emotion_text = call_groq_agent(EMOTION_SYSTEM_PROMPT, full_user_message)
+        coach_text = call_groq_agent(COACH_SYSTEM_PROMPT, full_user_message)
+        safety_text = call_groq_agent(SAFETY_SYSTEM_PROMPT, full_user_message)
+
+    except Exception as exc:
+        # Log nội bộ trên Render (stdout), UI sẽ nhận 500
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error while contacting Groq: {exc}",
+        )
+
+    # Final reply cho UI – gom lại 3 agent, nhưng vẫn dễ đọc cho sinh viên
+    # UI hiện chỉ dùng `reply`, còn 3 trường kia để debug / future UI.
+    if payload.lang and payload.lang.lower().startswith("vi"):
+        final_reply = (
+            f"**1. Cảm xúc của bạn**\n{emotion_text}\n\n"
+            f"**2. Gợi ý hỗ trợ**\n{coach_text}\n\n"
+            f"**3. An toàn & hỗ trợ khẩn cấp**\n{safety_text}"
+        )
+    else:
+        final_reply = (
+            f"**1. How you might be feeling**\n{emotion_text}\n\n"
+            f"**2. Support & next steps**\n{coach_text}\n\n"
+            f"**3. Safety & urgent support**\n{safety_text}"
+        )
 
     return ChatResponse(
-        reply=reply,
-        model=GROQ_MODEL,
-        meta={
-            "student_type": req.student_type,
-            "student_region": req.student_region,
-            "language": req.language,
-        },
+        reply=final_reply,
+        emotion=emotion_text,
+        coach=coach_text,
+        safety=safety_text,
     )
 
 
-@app.get("/export/messages")
-async def export_messages():
-    """
-    Xuất toàn bộ MESSAGE_LOGS thành file CSV.
-    UI đang gọi /export/messages nên giữ endpoint này.
-    """
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-
-    # Header
-    writer.writerow([
-        "timestamp",
-        "user_id",
-        "student_type",
-        "student_region",
-        "language",
-        "user_message",
-        "assistant_reply",
-        "model",
-    ])
-
-    for log in MESSAGE_LOGS:
-        writer.writerow([
-            log.timestamp,
-            log.user_id or "",
-            log.student_type or "",
-            log.student_region or "",
-            log.language or "",
-            log.user_message.replace("\n", " ").strip(),
-            log.assistant_reply.replace("\n", " ").strip(),
-            log.model,
-        ])
-
-    output.seek(0)
-    headers = {
-        "Content-Disposition": 'attachment; filename="wellbeing_messages.csv"'
-    }
-    return StreamingResponse(output, media_type="text/csv", headers=headers)
-
-
-# =========================
-# 7. LOCAL DEV ENTRYPOINT
-# =========================
+# =========================================================
+#  Local dev entrypoint (không dùng trên Render nhưng tiện test)
+# =========================================================
 
 if __name__ == "__main__":
     import uvicorn
