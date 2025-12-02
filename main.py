@@ -436,6 +436,8 @@ def is_celebration_context(all_msgs: List[ChatMessage]) -> bool:
         "trung hoc bong",
         "được học bổng",
         "duoc hoc bong",
+        "học bổng",
+        "hoc bong",
         "đậu visa",
         "dau visa",
         "được nhận",
@@ -543,6 +545,14 @@ def build_joy_block(language: str, joy_mode: bool) -> str:
 The user is sharing clearly positive news with low risk and the conversation
 is in Vietnamese.
 
+JOY STICKY RULES (very important):
+- This is NOT only for the first reply. As long as the student keeps
+  talking about this good news (for example scholarship, trúng số,
+  ăn mừng, đi chơi, mua gì để thưởng cho bản thân), you MUST stay
+  in the same joyful friend mode across the following turns.
+- Only when the student later shows clear sadness, stress, or violence,
+  you may switch out of joy mode.
+
 Joy mode instructions:
 - Respond exactly like a close Vietnamese friend (Southern casual style is OK).
 - Tone: very warm, excited, funny and friendly.
@@ -563,6 +573,13 @@ Joy mode instructions:
 The user is sharing clearly positive news with low risk and the conversation
 is in English.
 
+JOY STICKY RULES:
+- Do NOT treat joy mode as one-shot. As long as the student keeps discussing
+  how to celebrate, what to buy, who to tell, or how they feel about this
+  good news, you must continue to sound like a close friend.
+- Only switch to a more serious supportive tone if the student starts
+  expressing sadness, stress, or talks about harm/violence.
+
 Joy mode instructions:
 - Respond like a close uni friend (Aussie style is OK).
 - Tone: warm, excited, relaxed.
@@ -581,6 +598,12 @@ Joy mode instructions:
 The user is sharing clearly positive news with low risk and the conversation
 is in Chinese.
 
+JOY STICKY RULES:
+- Keep the same happy-friend style for the whole mini-conversation
+  about this good news, not just the first reply.
+- Only change tone if the student later shows sadness, stress,
+  or talks about harm/violence.
+
 Joy mode instructions:
 - Respond like a close Chinese-speaking friend.
 - Tone: warm, excited, casual.
@@ -596,6 +619,12 @@ Joy mode instructions:
         return """
 The user is sharing clearly positive news with low risk and the conversation
 is in Korean.
+
+JOY STICKY RULES:
+- Continue to use the same cheerful friend tone while the student is
+  still talking about this good news.
+- Only leave joy mode if the student later expresses strong negative
+  emotions or risk.
 
 Joy mode instructions:
 - Respond like a close Korean friend.
@@ -613,6 +642,12 @@ Joy mode instructions:
 The user is sharing clearly positive news with low risk and the conversation
 is in Japanese.
 
+JOY STICKY RULES:
+- Keep the same joyful, friendly tone for the whole conversation
+  about this good news.
+- Only switch tone if the student later expresses sadness, stress
+  or talks about risk/violence.
+
 Joy mode instructions:
 - Respond like a close Japanese friend.
 - Tone: warm, excited, casual.
@@ -626,6 +661,12 @@ Joy mode instructions:
 
     return """
 The user is sharing clearly positive news with low risk (unknown language).
+
+JOY STICKY RULES:
+- Stay in this joyful, close-friend style for the whole mini-conversation
+  about this good news, not only the first message.
+- Only change tone if the student later expresses strong negative
+  emotions or risk.
 
 Joy mode instructions:
 - Reply like a close friend in the same language as the student.
@@ -650,27 +691,18 @@ def run_response_agent(
     # Language from insight or fallback
     language = insights.get("language") or detect_language_fallback(req.message)
 
-    # Joy Sticky: check whole conversation context for celebration flow
+    # Build full message list for context-based joy detection
     all_msgs: List[ChatMessage] = list(req.history) + [
         ChatMessage(role="user", content=req.message)
     ]
-    celebration_flow = is_celebration_context(all_msgs)
 
-    # Base joy mode from insight (single turn)
     risk_level = insights.get("risk_level")
-    joy_mode_from_insight = bool(
-        insights.get("positive_event") and risk_level == "low"
-    )
-
-    # Final joy mode: either explicit positive_event OR celebration context with low risk
-    joy_mode = bool(
-        joy_mode_from_insight
-        or (celebration_flow and (risk_level in [None, "low"]))
-    )
-
     msg_low = req.message.lower()
 
-    # If strong negative / violence keywords appear, force Joy OFF
+    # JOY STICKY V2 LOGIC
+    celebration_flow = is_celebration_context(all_msgs)
+    joy_single_turn = bool(insights.get("positive_event") and risk_level == "low")
+
     negative_break_keywords = [
         "buồn",
         "buon",
@@ -698,13 +730,20 @@ def run_response_agent(
         "tu sat",
     ]
 
-    if any(kw in msg_low for kw in negative_break_keywords):
+    forced_joy_off = any(kw in msg_low for kw in negative_break_keywords)
+
+    if forced_joy_off or risk_level in ["medium", "high"]:
         joy_mode = False
-        celebration_flow = False
+    else:
+        # Joy if:
+        # - conversation context clearly celebration, OR
+        # - single-turn positive_event low-risk
+        joy_mode = bool(celebration_flow or joy_single_turn)
 
     language_block = build_language_block(language)
     joy_block = build_joy_block(language, joy_mode)
 
+    # Decide whether to add support block
     effective_risk = safety.get("override_risk_level") or risk_level
 
     emotional_keywords = [
@@ -789,7 +828,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - 7 Agents, Joy Sticky, Violence Safety, Adelaide Support"
+    title="Wellbeing Agent - 7 Agents, Joy Sticky Flow Fix V2, Violence Safety, Adelaide Support"
 )
 
 app.add_middleware(
