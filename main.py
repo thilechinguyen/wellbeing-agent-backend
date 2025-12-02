@@ -735,7 +735,17 @@ def run_response_agent(
     if joy_mode:
         add_support = False
 
-    support_block = ADELAIDE_SUPPORT if add_support else ""
+    # Force the model to append Adelaide support block at the END
+    support_instruction = ""
+    if add_support:
+        support_instruction = f"""
+Because the student's risk is '{effective_risk}' or they expressed strong negative emotions,
+you MUST append the following support information block at the END of your reply,
+after your own supportive message. Do not translate or summarise this block, copy it as-is.
+
+Support block (University of Adelaide):
+{ADELAIDE_SUPPORT}
+"""
 
     system_content = (
         BASE_SYSTEM_PROMPT
@@ -755,8 +765,11 @@ def run_response_agent(
         {"role": "system", "content": f"Profile summary:\n{profile_summary}"},
         {"role": "system", "content": f"Trend info:\n{trend}"},
         {"role": "system", "content": f"Internal intervention suggestions:\n{interventions}"},
-        {"role": "system", "content": support_block},
     ]
+
+    # Nếu cần hỗ trợ thì thêm system message bắt buộc chèn block
+    if support_instruction:
+        messages.append({"role": "system", "content": support_instruction})
 
     for m in req.history:
         messages.append({"role": m.role, "content": m.content})
@@ -776,7 +789,7 @@ def run_response_agent(
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - 7 Agents, Joy Sticky Auto OFF for Violence/Negative"
+    title="Wellbeing Agent - 7 Agents, Joy Sticky, Violence Safety, Adelaide Support"
 )
 
 app.add_middleware(
