@@ -1,27 +1,50 @@
 import os
 import logging
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from dotenv import load_dotenv
 from groq import Groq
 
+# Local modules
+from export_data import (
+    load_messages,
+    export_csv,
+    export_pdf,
+    EXPORT_DIR,
+    CSV_PATH,
+)
 
-# ---------------------------------------------------------
-# 1. Logging
-# ---------------------------------------------------------
+from conversation_logging import (
+    init_db,
+    log_turn,
+    attach_export_routes,
+)
+
+# ============================================================
+# 1. Load environment variables (.env)
+# ============================================================
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+# ============================================================
+# 2. Logging
+# ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wellbeing-backend")
 
-# ---------------------------------------------------------
-# 2. Environment
-# ---------------------------------------------------------
+# ============================================================
+# 3. Environment variables
+# ============================================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY is not set in environment")
+MODEL_ID = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-MODEL_ID = "llama-3.1-8b-instant"
+if not GROQ_API_KEY:
+    raise RuntimeError("❌ GROQ_API_KEY is not set in .env")
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -30,10 +53,16 @@ ALLOW_ORIGINS = os.getenv(
     "https://wellbeing-agent-ui.onrender.com,http://localhost:3000"
 ).split(",")
 
-# ---------------------------------------------------------
-# 3. FastAPI app + CORS
-# ---------------------------------------------------------
-app = FastAPI(title="Wellbeing Agent Backend (Groq + Llama 3.1 8B)")
+
+# ============================================================
+# 4. FastAPI App
+# ============================================================
+app = FastAPI(
+    title="Wellbeing Agent Backend (Groq Llama3.1-8B)"
+)
+
+init_db()
+attach_export_routes(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,14 +72,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------
-# 4. Data models
-# ---------------------------------------------------------
+
+# ============================================================
+# 5. Routes: Export CSV + ZIP PDF
+# ============================================================
+@app.get("/export/csv")
+def export_csv_endpoint():
+    messages = load_messages()
+    if not messages:
+        raise HTTPException(404, "No data available")
+
+    export_csv(messages)
+
+    return FileResponse(
+        CSV_PATH,
+        media_type="text/csv",
+        filename="wellbeing_conversations.csv",
+    )
+
+
+@app.get("/export/report")
+def export_report_endpoint():
+    """
+    Sinh PDF (1 file/user_id) → trả về 1 file ZIP.
+    """
+    messages = load_messages()
+    if not messages:
+        raise HTTPException(404, "No messages found.")
+
+    export_pdf(messages)
+
+    reports_dir = EXPORT_DIR / "reports"
+    if not reports_dir.exists():
+        raise HTTPException(500, "Reports directory missing.")
+
+    # Tạo file zip tạm
+    import tempfile, shutil
+    tmp_dir = tempfile.mkdtemp()
+    zip_path = Path(tmp_dir) / "wellbeing_reports.zip"
+
+    shutil.make_archive(
+        base_name=str(zip_path.with_suffix("")),
+        format="zip",
+        root_dir=str(reports_dir),
+    )
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename="wellbeing_reports.zip",
+    )
+
+
+# ============================================================
+# 6. Models
+# ============================================================
 class ChatRequest(BaseModel):
+    user_id: str
     message: str
-    student_type: Optional[str] = "Domestic (Australia)"
-    student_region: Optional[str] = "Australia"
-    language: Optional[str] = "vi"  # "vi" | "en" – cho phép tùy chọn nếu sau này cần
+
+    # Metadata được UI nhúng vào message, nhưng ta hỗ trợ thêm:
+    session_id: Optional[str] = None
+    turn_index: Optional[int] = None
+    lang_code: Optional[str] = "vi"
+
+    # Lưu cho DB
+    student_type: Optional[str] = "domestic"
+    student_region: Optional[str] = "au"
 
 
 class ChatResponse(BaseModel):
@@ -58,230 +146,119 @@ class ChatResponse(BaseModel):
     emotion_summary: str
 
 
-# ---------------------------------------------------------
-# 5. System + Agent Prompts
-# ---------------------------------------------------------
-
-SYSTEM_PROMPT = CBT_COACH_PROMPT = """
-You are a CBT-style wellbeing companion for first-year University of Adelaide students.
-
-Your role is to:
-- Help students understand the link between situations → thoughts → emotions → behaviours.
-- Offer small, practical “behavioural experiments”.
-- Keep a warm, validating, human tone.
-- Include University of Adelaide support options in a natural, contextual way—not as a list of links dumped abruptly.
-- Always match the student's language (Vietnamese → reply in Vietnamese; English → reply in English).
-
-=== RESPONSE STRUCTURE (SOFT, NATURAL CBT STYLE) ===
-
-1) EMOTIONAL VALIDATION (2–3 sentences)
-   - Acknowledge how the student feels.
-   - Show empathy, normalisation, and emotional understanding.
-
-2) CBT REFLECTION (2–3 sentences)
-   - Gently reflect the situation: what might be triggering the emotion?
-   - Identify possible automatic thoughts or interpretations.
-   - Show how these thoughts might shape emotions/behaviour.
-
-3) REFRAME (1–2 sentences)
-   - Offer 1–2 balanced alternative ways of viewing the situation.
-   - Soft wording (“perhaps”, “it might help to consider”, “one possible interpretation is…”).
-
-4) PRACTICAL STEPS (2–4 items)
-   - Suggest small actions (behavioural experiments):
-       • journaling a thought
-       • sending one message to a classmate
-       • taking a short walk to reset attention
-       • breaking a task into tiny steps
-   - If relevant, naturally integrate 1–2 University of Adelaide supports:
-       • Counselling Support – https://www.adelaide.edu.au/counselling
-       • Wellbeing Hub – https://www.adelaide.edu.au/student/wellbeing
-       • AskADEL – https://www.adelaide.edu.au/ask-adelaide/
-       • International Student Support – https://international.adelaide.edu.au/student-support
-       • Writing Centre – https://www.adelaide.edu.au/writingcentre
-       • Maths Learning Centre – https://www.adelaide.edu.au/mathslearning/
-       • AUU Clubs – https://auu.org.au/clubs/
-   - DO NOT dump URLs in a block. Only include them when relevant to the student’s issue.
-
-5) HELP-SEEKING MESSAGE (1–2 sentences)
-   - Gentle reminder they’re not alone.
-   - Encourage reaching out to someone trusted or appropriate UofA service.
-   - For high distress: include crisis line (1300 167 654 / 0488 884 197).
-
-=== IMPORTANT STYLE RULES ===
-- Sound human, warm, supportive.
-- Avoid generic self-help tone.
-- No clinical or diagnostic language.
-- No overwhelming number of links.
-- Each reply should feel personalised to the student's specific emotion summary.
-
-Emotion summary (from analyst):
-{emotion_summary}
-"""
-
-
+# ============================================================
+# 7. Prompts
+# ============================================================
 EMOTION_ANALYST_PROMPT = """
 You are an EMOTION ANALYST.
-
-Goal:
-- Read the student's message and briefly summarise:
-  • main emotions (e.g. lonely, anxious, overwhelmed)
-  • rough intensity (e.g. mild / moderate / strong)
-  • main themes (friends, study load, exams, money, homesickness, family, etc.)
-
-Output format (short, max 3–4 sentences, English):
-- Emotions:
-- Intensity:
-- Themes:
+Summarise in 3–4 short sentences:
+- Emotions
+- Intensity
+- Themes
 """
 
 CBT_COACH_PROMPT = """
-You are a CBT-STYLE COACH and student wellbeing companion at the University of Adelaide.
+You are a CBT wellbeing companion for first-year University of Adelaide students.
 
-Use:
-- The student's profile (type, region)
-- The emotion summary from EMOTION ANALYST
-- The original student message
-
-Your reply must:
-1) Start with a short empathetic validation (1–2 sentences).
-2) Reflect the main emotions/themes in simple language.
-3) Offer 2–4 very concrete next steps that a first-year student at UofA can actually do:
-   • on-campus places (Hub Central, counselling, Writing Centre, Maths Learning Centre, clubs, peer mentoring)
-   • online supports (Studiosity, wellbeing website)
-4) If the student sounds very distressed or unsafe, gently mention crisis contacts 
-   (1300 167 654 or text 0488 884 197) and University Counselling, but DO NOT panic or be dramatic.
-5) Use a friendly, calm tone.
-
-Write in the same language as the student's message (if Vietnamese, reply in Vietnamese; 
- if English, reply in English).
-
-Emotion summary (from analyst):
+Emotion summary:
 {emotion_summary}
+
+Rules:
+- Warm, validating, simple language.
+- Match student’s language.
+- Provide 2–4 realistic next steps.
+- Include UoA supports only if appropriate.
+- If distress → mention crisis line 1300 167 654 or text 0488 884 197.
 """
 
 SAFETY_REVIEW_PROMPT = """
-You are a SAFETY FILTER.
-
-You receive:
-- The student's original message.
-- A candidate supportive reply from a CBT-style coach.
-
-Your job:
-- Check if the candidate reply is:
-  • non-judgmental
-  • does NOT promise confidentiality or medical outcomes
-  • does NOT give medical, psychiatric, or legal advice
-  • does NOT encourage self-harm, substance abuse, or risky behaviour
-- If the reply is fine, output it unchanged.
-- If something is risky, rewrite the reply to be safer, 
-  emphasising seeking help (University Counselling, crisis line, trusted adults, emergency services).
-
-Always answer in the SAME language as the candidate reply.
-Return ONLY the final safe reply text, no explanation.
+Rewrite only if needed to make the reply safer.
+Never mention being an AI.
+Always keep the same language as the reply.
+Return ONLY the final text.
 """
 
 
-# ---------------------------------------------------------
-# 6. Groq helper
-# ---------------------------------------------------------
-def call_groq_chat(system_prompt: str, user_prompt: str) -> str:
-    """
-    Call Groq ChatCompletion with a system + user prompt and return the text.
-    """
+# ============================================================
+# 8. Helper: Call Groq
+# ============================================================
+def call_groq(system, user):
     try:
         completion = client.chat.completions.create(
             model=MODEL_ID,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             temperature=0.4,
             max_tokens=900,
         )
-        return (completion.choices[0].message.content or "").strip()
+        return completion.choices[0].message.content.strip()
     except Exception as e:
-        logger.exception("Groq API error")
-        raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
+        logger.exception(e)
+        raise HTTPException(500, f"Groq error: {e}")
 
 
-# ---------------------------------------------------------
-# 7. Health endpoint
-# ---------------------------------------------------------
+# ============================================================
+# 9. Health Check
+# ============================================================
 @app.get("/health")
 def health():
-    # Để frontend test nhanh xem backend có sống + model có chạy không
-    try:
-        test = call_groq_chat(
-            SYSTEM_PROMPT,
-            "Short health check: reply with exactly 'ok'.",
-        )
-    except HTTPException as e:
-        raise e
-
-    return {"status": "ok", "model": MODEL_ID, "llm_reply": test}
+    test = call_groq("Say 'ok'.", "Say ok.")
+    return {"status": "ok", "model": MODEL_ID, "llm": test}
 
 
-# ---------------------------------------------------------
-# 8. Orchestrator endpoint /chat
-# ---------------------------------------------------------
+# ============================================================
+# 10. Main Chat Orchestrator
+# ============================================================
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    """
-    Pipeline:
-    1. Emotion analyst => emotion_summary (internal, dùng làm context).
-    2. CBT coach => candidate_reply (câu trả lời chính).
-    3. Safety filter => final_reply (chỉnh nếu cần).
-    → Frontend chỉ nhận final_reply + emotion_summary (optional logging).
-    """
 
-    user_message = req.message.strip()
-    if not user_message:
-        raise HTTPException(status_code=400, detail="Message is empty.")
+    if not req.message.strip():
+        raise HTTPException(400, "Empty message")
 
-    # ----- 1) Build profile text -----
-    profile_text = (
+    # ---- Build profile text ----
+    profile = (
         f"Student type: {req.student_type}. "
         f"Region: {req.student_region}. "
-        "They are a first-year student at the University of Adelaide."
+        "First-year University of Adelaide student."
     )
 
-    # ----- 2) Emotion Analyst (internal) -----
-    emotion_input = (
-        f"Student profile: {profile_text}\n\n"
-        f"Student message:\n{user_message}"
-    )
-    emotion_summary = call_groq_chat(
-        SYSTEM_PROMPT + "\n" + EMOTION_ANALYST_PROMPT,
-        emotion_input,
+    # ---- 1) Emotion Analyst ----
+    emotion_summary = call_groq(
+        EMOTION_ANALYST_PROMPT,
+        f"{profile}\n\nMessage:\n{req.message}"
     )
 
-    # ----- 3) CBT Coach (main reply) -----
-    cbt_prompt_filled = CBT_COACH_PROMPT.format(
+    # ---- 2) CBT Coach ----
+    coach_prompt = CBT_COACH_PROMPT.format(
         emotion_summary=emotion_summary
     )
-    coach_input = (
-        f"Student profile: {profile_text}\n\n"
-        f"Student message:\n{user_message}"
-    )
-    candidate_reply = call_groq_chat(
-        SYSTEM_PROMPT + "\n" + cbt_prompt_filled,
-        coach_input,
+
+    candidate_reply = call_groq(
+        coach_prompt,
+        f"{profile}\n\nMessage:\n{req.message}"
     )
 
-    # ----- 4) Safety Review (rewrite if needed) -----
-    safety_input = (
-        "Student message:\n"
-        f"{user_message}\n\n"
-        "Candidate reply from CBT coach:\n"
-        f"{candidate_reply}"
-    )
-    final_reply = call_groq_chat(
+    # ---- 3) Safety Filter ----
+    final_reply = call_groq(
         SAFETY_REVIEW_PROMPT,
-        safety_input,
+        f"Student message:\n{req.message}\n\nCandidate reply:\n{candidate_reply}"
     )
 
-    # → Quan trọng: CHỈ trả về final_reply, KHÔNG join 3 câu trả lời
+    # ---- 4) Save to DB ----
+    log_turn(
+        session_id=req.session_id,
+        turn_index=req.turn_index,
+        user_id=req.user_id,
+        user_text=req.message,
+        agent_text=final_reply,
+        emotion=emotion_summary,
+        safety=None,
+        supervisor=None,
+        lang_code=req.lang_code,
+    )
+
     return ChatResponse(
         reply=final_reply,
         emotion_summary=emotion_summary,

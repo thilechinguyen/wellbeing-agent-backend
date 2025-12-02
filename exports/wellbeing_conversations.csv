@@ -1,0 +1,2 @@
+turn_id,user_id,condition,language,user_text,agent_text,emotion,stress_level,main_issue,safety_flag,safety_notes
+1,user_demo,baseline,vi,Em thấy rất stress vì bài tập và công việc part-time.,Anh hiểu là em đang cảm thấy quá tải. Mình thử chia nhỏ công việc và lên kế hoạch nghỉ ngơi hợp lý hơn nhé.,sad,high,academic workload,0,No immediate risk detected

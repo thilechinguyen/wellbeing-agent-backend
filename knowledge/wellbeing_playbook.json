@@ -1,0 +1,93 @@
+{
+  "global": {
+    "cbt_validation_patterns": [
+      "It makes a lot of sense that you feel this way in this situation.",
+      "Many students would feel similarly if they were in your position.",
+      "Your feelings are valid, and it's okay to acknowledge them.",
+      "This sounds really tough, and it's understandable that you're struggling."
+    ],
+    "cbt_reframe_hints": [
+      "Is there any evidence that things could turn out better than you expect?",
+      "What might you say to a friend who was in the same situation?",
+      "Is it possible that your mind is focusing mainly on the worst-case scenario?",
+      "Are there any small signs that you are coping better than you think?"
+    ],
+    "micro_interventions": [
+      "3-minute breathing reset",
+      "5-minute grounding using the 5-4-3-2-1 method",
+      "Write down one balanced thought about the situation",
+      "Send one short message to a friend or classmate",
+      "Take a short walk and focus on breathing"
+    ],
+    "first_year_common_struggles": [
+      "academic pressure",
+      "loneliness or isolation",
+      "worries about grades",
+      "belonging uncertainty",
+      "balancing study, work, and life"
+    ],
+    "cognitive_distortions": {
+      "catastrophizing": "Jumping straight to the worst possible outcome.",
+      "mind_reading": "Assuming you know what others think.",
+      "overgeneralisation": "Assuming one bad situation will always repeat.",
+      "all_or_nothing": "Seeing things in extremes only."
+    },
+    "uni_support": {
+      "wellbeing": "https://www.adelaide.edu.au/student/wellbeing/",
+      "counselling": "https://www.adelaide.edu.au/student/wellbeing/counselling-support",
+      "international": "https://www.adelaide.edu.au/student/international/",
+      "finance": "https://www.adelaide.edu.au/student/finance/"
+    }
+  },
+  "profiles": {
+    "domestic_au": {
+      "typical_stressors": [
+        "balancing casual work with study",
+        "worry about HECS or future debt",
+        "fitting in with peers",
+        "managing independence"
+      ],
+      "help_seeking_barriers": [
+        "not wanting to appear weak",
+        "feeling like problems aren't serious enough",
+        "self-reliance pressure"
+      ]
+    },
+    "intl_se_asia": {
+      "typical_stressors": [
+        "visa and enrolment worries",
+        "family pressure and expectations",
+        "language anxiety",
+        "homesickness"
+      ],
+      "help_seeking_barriers": [
+        "fear of burdening others",
+        "worry about losing face",
+        "uncertainty about uni support services"
+      ]
+    },
+    "intl_europe": {
+      "typical_stressors": [
+        "different academic system",
+        "housing and living cost issues",
+        "loss of familiar social networks"
+      ],
+      "help_seeking_barriers": [
+        "belief you should adapt quickly",
+        "minimising personal difficulties"
+      ]
+    },
+    "intl_other": {
+      "typical_stressors": [
+        "cultural adjustment",
+        "missing home",
+        "navigating local norms",
+        "visa stress"
+      ],
+      "help_seeking_barriers": [
+        "stigma around seeking help",
+        "not knowing where to start"
+      ]
+    }
+  }
+}

@@ -4,3 +4,4 @@ python-dotenv
 groq
 httpx
 requests
+fpdf2
