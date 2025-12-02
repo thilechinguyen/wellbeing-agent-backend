@@ -7,22 +7,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wellbeing-backend")
 
-# Environment
+# ============================================================
+# ENV
+# ============================================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not set")
 
-GROQ_MODEL_ID = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
-
+MODEL_ID = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-
 # ============================================================
-# University of Adelaide Support Pack
+# University of Adelaide Support (Will be conditionally injected)
 # ============================================================
 ADELAIDE_SUPPORT = """
 University of Adelaide – Student Wellbeing Support
@@ -41,12 +40,11 @@ University of Adelaide – Student Wellbeing Support
   https://international.adelaide.edu.au/student-support
 
 • Emergency (Australia-wide)
-  Call 000 for urgent life-threatening emergencies.
+  Call 000 for urgent emergencies.
 """
 
-
 # ============================================================
-# Pydantic Models
+# MODELS
 # ============================================================
 class ChatMessage(BaseModel):
     role: str
@@ -62,18 +60,17 @@ class ChatResponse(BaseModel):
 
 
 # ============================================================
-# AGENT 1 – INSIGHT AGENT
-# phân tích tin nhắn → risk level, emotions, topics
+# AGENT 1 — INSIGHT AGENT
 # ============================================================
 def run_insight_agent(message: str) -> Dict[str, Any]:
     prompt = f"""
-You are an Insight Extraction Agent for a wellbeing system.
+You are the Insight Extraction Agent.
 Analyse the student's message and extract:
 
-- emotion: one-word emotion (e.g., joy, sadness, worry, stress)
+- emotion: (one word)
 - risk_level: low / medium / high
 - positive_event: true/false
-- topics: list of short tags (e.g., exam, loneliness, homesickness)
+- topics: list of tags
 
 Return ONLY valid JSON.
 
@@ -82,98 +79,117 @@ Message:
 """
     try:
         completion = groq_client.chat.completions.create(
-            model=GROQ_MODEL_ID,
+            model=MODEL_ID,
             messages=[{"role": "system", "content": prompt}],
-            temperature=0.2
+            temperature=0.2,
         )
         import json
         return json.loads(completion.choices[0].message.content)
+
     except Exception as e:
         logger.warning("Insight agent failed:", e)
         return {
             "emotion": "neutral",
             "risk_level": "low",
             "positive_event": False,
-            "topics": []
+            "topics": [],
         }
 
 
 # ============================================================
-# AGENT 2 – PROFILE AGENT
-# nhận insight + history → tạo profile summary
+# AGENT 2 — PROFILE AGENT
 # ============================================================
 def run_profile_agent(student_id: str, insights: Dict[str, Any]) -> str:
     prompt = f"""
-You are the Profile Agent. Your job is to summarise the student's
-current wellbeing state from the extracted insights.
+You are the Profile Agent.
+Produce a SHORT 2–3 sentence summary describing:
 
-Student ID: {student_id}
+- the student's emotional state
+- key concerns/topics
+- whether this moment is positive or negative
 
-Insights:
+Insight data:
 {insights}
-
-Create a SHORT 2–3 sentence summary describing:
-- the student's emotional tone
-- the key concerns or topics
-- whether this is a positive-mood or negative-mood moment
 """
     completion = groq_client.chat.completions.create(
-        model=GROQ_MODEL_ID,
+        model=MODEL_ID,
         messages=[{"role": "system", "content": prompt}],
-        temperature=0.3
+        temperature=0.3,
     )
     return completion.choices[0].message.content
 
 
 # ============================================================
-# BASE SYSTEM PROMPT for Agent 3 (Wellbeing Response Agent)
+# SYSTEM PROMPT — STRICT LANGUAGE + STRICT SUPPORT CONDITIONS
 # ============================================================
 BASE_SYSTEM_PROMPT = f"""
 You are a warm wellbeing companion for University of Adelaide students.
-You use CBT, Positive Psychology and supportive counselling skills,
-but you are *not* a therapist and never diagnose.
+Use CBT, Positive Psychology, supportive listening — but you are NOT a therapist.
 
-You ALWAYS stay culturally sensitive and respond in the student's language.
+LANGUAGE RULES (STRICT):
+- If the student writes primarily in Vietnamese → ALWAYS reply 100% in Vietnamese.
+- If the student writes primarily in English → ALWAYS reply 100% in English.
+- NEVER reply in Chinese/Japanese/Korean unless the ENTIRE user message is in that language.
+- If the user includes 1–2 Chinese characters in a Vietnamese/English sentence
+  (e.g., “để庆祝”), treat them as normal text and DO NOT explain them unless the user explicitly asks:
+  (“dịch chữ này”, “giải thích chữ này”, “what does this mean”).
+- NEVER spontaneously switch to Chinese or give bilingual explanations.
 
-You also ALWAYS include, when appropriate, the following official support information:
+SUPPORT RULES (STRICT):
+- Only provide University of Adelaide wellbeing/counselling support information when:
+  (1) The insight risk_level is medium or high, OR
+  (2) The user expresses sadness, stress, anxiety, loneliness, overwhelm.
+- DO NOT provide support info for neutral, positive, playful, or definition-type questions.
 
-{ADELAIDE_SUPPORT}
+GOOD NEWS RULES:
+- If user shares positive news → respond joyfully, naturally, friendly.
+- Keep it light and human, no clinical tone.
 
-RULES FOR GOOD NEWS:
-- celebrate warmly
-- respond like a natural friend
-- light, joyful tone
-- avoid clinical analysis unless asked
-- keep it short and human
-
-RULES FOR STRESS/SADNESS:
-- validate feelings
-- be calm, soft, gentle
-- offer small practical next steps
-- provide counselling/crisis info ONLY if relevant
+NEGATIVE EMOTION RULES:
+- Validate feelings softly.
+- Offer small practical steps.
+- Only then add support info (if support conditions are satisfied).
 
 NEVER:
-- give legal/financial/medical advice
-- promise confidentiality
+- Give medical/legal/financial advice.
+- Promise confidentiality.
 """
 
+
 # ============================================================
-# AGENT 3 – WELLBEING RESPONSE AGENT
+# AGENT 3 — RESPONSE AGENT
 # ============================================================
 def run_response_agent(req: ChatRequest, profile_summary: str, insights: Dict[str, Any]) -> str:
 
-    # Nếu là positive event → thêm tone vui
+    # JOY MODE (if positive event)
     joy_boost = ""
     if insights.get("positive_event"):
         joy_boost = """
-The student is sharing GOOD NEWS.
-Respond in a happy, natural, uplifting tone.
-Do NOT be clinical. Celebrate with them warmly.
+USER IS SHARING GOOD NEWS.
+Respond with joyful, warm, natural tone. No clinical analysis.
 """
 
+    # Determine if we should inject support info
+    msg_low = req.message.lower()
+    add_support = False
+
+    if insights.get("risk_level") in ["medium", "high"]:
+        add_support = True
+
+    emotional_keywords = [
+        "stress", "lo lắng", "buồn", "sad", "tired",
+        "khó chịu", "overwhelmed", "burnout", "anxious"
+    ]
+    if any(kw in msg_low for kw in emotional_keywords):
+        add_support = True
+
+    support_block = ADELAIDE_SUPPORT if add_support else ""
+
+    # Build messages
     messages = [
         {"role": "system", "content": BASE_SYSTEM_PROMPT + joy_boost},
         {"role": "system", "content": f"Profile Summary:\n{profile_summary}"},
+        {"role": "system", "content": support_block},
     ]
 
     for m in req.history:
@@ -182,19 +198,18 @@ Do NOT be clinical. Celebrate with them warmly.
     messages.append({"role": "user", "content": req.message})
 
     completion = groq_client.chat.completions.create(
-        model=GROQ_MODEL_ID,
+        model=MODEL_ID,
         messages=messages,
         temperature=0.6,
-        max_tokens=1024
+        max_tokens=1024,
     )
     return completion.choices[0].message.content
 
 
 # ============================================================
-# FastAPI setup
+# FASTAPI APP
 # ============================================================
-app = FastAPI(title="Wellbeing Agent – 3 Agent Pipeline")
-
+app = FastAPI(title="Wellbeing Agent — 3 Agent Pipeline (Strict Fix)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -209,15 +224,14 @@ app.add_middleware(
 def chat(req: ChatRequest):
 
     student_id = req.student_id or "anonymous"
-    msg = req.message
 
-    # 1) INSIGHT AGENT
-    insights = run_insight_agent(msg)
+    # 1) INSIGHT
+    insights = run_insight_agent(req.message)
 
-    # 2) PROFILE AGENT
+    # 2) PROFILE
     profile = run_profile_agent(student_id, insights)
 
-    # 3) RESPONSE AGENT (final answer)
+    # 3) RESPONSE
     reply = run_response_agent(req, profile, insights)
 
     return ChatResponse(reply=reply)
@@ -225,4 +239,4 @@ def chat(req: ChatRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": GROQ_MODEL_ID}
+    return {"status": "ok", "model": MODEL_ID}
