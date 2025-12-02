@@ -283,7 +283,7 @@ Message: {message}
 
 
 # ============================================================
-# AGENT 5 - Safety Agent
+# AGENT 5 - Safety Agent (includes relationship violence)
 # ============================================================
 def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
     base = {"escalate": False, "reason": "", "override_risk_level": None}
@@ -293,18 +293,43 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
         "tự tử",
         "tự sát",
         "không muốn sống",
+        "khong muon song",
         "kill myself",
         "end my life",
         "suicide",
         "hurt myself",
         "giết người",
+        "giet nguoi",
         "kill someone",
+    ]
+
+    relationship_violence = [
+        "đánh em",
+        "danh em",
+        "bị đánh",
+        "bi danh",
+        "bạo lực",
+        "bao luc",
+        "hit me",
+        "hurt me",
+        "abused me",
+        "domestic violence",
+        "he hit me",
+        "he slapped me",
+        "he punched me",
     ]
 
     if any(kw in msg for kw in danger_keywords):
         return {
             "escalate": True,
             "reason": "Self-harm or harm-others keywords detected",
+            "override_risk_level": "high",
+        }
+
+    if any(kw in msg for kw in relationship_violence):
+        return {
+            "escalate": True,
+            "reason": "Relationship violence detected",
             "override_risk_level": "high",
         }
 
@@ -434,6 +459,12 @@ def is_celebration_context(all_msgs: List[ChatMessage]) -> bool:
         "sad",
         "anxious",
         "depressed",
+        "bị đánh",
+        "bi danh",
+        "đánh em",
+        "danh em",
+        "bạo lực",
+        "bao luc",
     ]
 
     if any(kw in text for kw in celebration_keywords) and not any(
@@ -626,33 +657,70 @@ def run_response_agent(
     celebration_flow = is_celebration_context(all_msgs)
 
     # Base joy mode from insight (single turn)
+    risk_level = insights.get("risk_level")
     joy_mode_from_insight = bool(
-        insights.get("positive_event") and insights.get("risk_level") == "low"
+        insights.get("positive_event") and risk_level == "low"
     )
 
     # Final joy mode: either explicit positive_event OR celebration context with low risk
-    risk_level = insights.get("risk_level")
     joy_mode = bool(
         joy_mode_from_insight
         or (celebration_flow and (risk_level in [None, "low"]))
     )
+
+    msg_low = req.message.lower()
+
+    # If strong negative / violence keywords appear, force Joy OFF
+    negative_break_keywords = [
+        "buồn",
+        "buon",
+        "khóc",
+        "khoc",
+        "đau",
+        "dau",
+        "bị đánh",
+        "bi danh",
+        "đánh em",
+        "danh em",
+        "bạo lực",
+        "bao luc",
+        "hurt me",
+        "hit me",
+        "abused me",
+        "he hit me",
+        "he slapped me",
+        "he punched me",
+        "không muốn sống",
+        "khong muon song",
+        "tự tử",
+        "tự sát",
+        "tu tu",
+        "tu sat",
+    ]
+
+    if any(kw in msg_low for kw in negative_break_keywords):
+        joy_mode = False
+        celebration_flow = False
 
     language_block = build_language_block(language)
     joy_block = build_joy_block(language, joy_mode)
 
     effective_risk = safety.get("override_risk_level") or risk_level
 
-    msg_low = req.message.lower()
     emotional_keywords = [
         "stress",
         "lo lắng",
         "lo lang",
         "buồn",
         "buon",
+        "khóc",
+        "khoc",
         "sad",
         "anxious",
         "căng thẳng",
         "cang thang",
+        "cô đơn",
+        "co don",
     ]
 
     add_support = False
@@ -708,7 +776,7 @@ def run_response_agent(
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - 7 Agents, Context-aware Joy Sticky, Multilingual Slang"
+    title="Wellbeing Agent - 7 Agents, Joy Sticky Auto OFF for Violence/Negative"
 )
 
 app.add_middleware(
