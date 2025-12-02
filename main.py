@@ -75,7 +75,10 @@ def detect_language_fallback(message: str) -> str:
         return "ja"
 
     # Vietnamese diacritics
-    if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩị]", message):
+    if re.search(
+        r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩị]",
+        message,
+    ):
         return "vi"
 
     # Default English
@@ -125,27 +128,46 @@ class ChatResponse(BaseModel):
 
 
 # ============================================================
-# AGENT 1 - Insight Agent (with language)
+# AGENT 1 - Insight Agent (with context + language)
 # ============================================================
-def run_insight_agent(message: str) -> Dict[str, Any]:
+def run_insight_agent(message: str, history: List[ChatMessage]) -> Dict[str, Any]:
+    """
+    Use both recent context and latest message to infer:
+    - emotion
+    - risk_level
+    - positive_event
+    - topics
+    - language
+    """
+    recent = history[-4:]
+    context_text = "\n".join([f"{m.role}: {m.content}" for m in recent])
+
     prompt = f"""
 You are the Insight Extraction Agent in a wellbeing system.
 
-Task:
-- Read the student's message.
-- Return ONLY a JSON object with the following keys:
-  - "emotion": one word, for example "joy", "sadness", "worry", "stress", "anger", "neutral"
-  - "risk_level": "low", "medium", or "high"
-  - "positive_event": true or false
-  - "topics": a short list of 1-4 simple tags (for example ["exam", "friends"])
-  - "language": main language code of the message, one of:
-      "vi" (Vietnamese), "en" (English), "zh" (Chinese),
-      "ko" (Korean), "ja" (Japanese), or "other"
+You see a short conversation and the latest student message.
+You must classify the student's CURRENT emotional state
+by considering BOTH:
+- the recent context
+- the latest message
+
+Recent conversation (most recent at the end):
+{context_text}
+
+Latest student message:
+{message}
+
+Return ONLY a JSON object with the following keys:
+- "emotion": one word, for example "joy", "sadness", "worry",
+  "stress", "anger", "neutral"
+- "risk_level": "low", "medium", or "high"
+- "positive_event": true or false
+- "topics": a short list of 1-4 simple tags, for example ["exam", "friends"]
+- "language": main language code of the student's message and context, one of:
+    "vi" (Vietnamese), "en" (English), "zh" (Chinese),
+    "ko" (Korean), "ja" (Japanese), or "other"
 
 Do not include any explanation or extra text outside the JSON.
-
-Message:
-{message}
 """
     try:
         completion = groq_client.chat.completions.create(
@@ -368,7 +390,61 @@ Never:
 
 
 # ============================================================
-# Build language-specific Joy Mode and slang hints
+# Joy-context detection (Joy Sticky)
+# ============================================================
+def is_celebration_context(all_msgs: List[ChatMessage]) -> bool:
+    """
+    Check if the recent conversation is mainly about a positive event
+    like scholarship, lottery, getting a job, passing an exam, etc.
+    """
+    user_texts = [m.content.lower() for m in all_msgs if m.role == "user"]
+    if not user_texts:
+        return False
+
+    # Look at last few user messages only
+    text = " ".join(user_texts[-6:])
+
+    celebration_keywords = [
+        "trúng số",
+        "trung so",
+        "trúng học bổng",
+        "trung hoc bong",
+        "được học bổng",
+        "duoc hoc bong",
+        "đậu visa",
+        "dau visa",
+        "được nhận",
+        "duoc nhan",
+        "passed the exam",
+        "pass the exam",
+        "got a scholarship",
+        "won the lottery",
+        "got the job",
+        "got an offer",
+        "accepted into",
+    ]
+    negative_keywords = [
+        "buồn",
+        "buon",
+        "stress",
+        "lo lắng",
+        "lo lang",
+        "không muốn sống",
+        "khong muon song",
+        "sad",
+        "anxious",
+        "depressed",
+    ]
+
+    if any(kw in text for kw in celebration_keywords) and not any(
+        kw in text for kw in negative_keywords
+    ):
+        return True
+    return False
+
+
+# ============================================================
+# Language-specific blocks
 # ============================================================
 def build_language_block(language: str) -> str:
     if language == "vi":
@@ -379,7 +455,7 @@ When replying in Vietnamese:
 - Use simple, natural Vietnamese, can be Southern-style if the message suggests it.
 - Understand slang such as:
   "ăn bể bụng" (eat a lot, very full),
-  "bún có bèo" (too cheap / too basic for celebration),
+  "bún có bèo" (too cheap or too basic for celebration),
   "bèo quá hong?" (is it too cheap?),
   "xỉu up xỉu down" (very shocked or excited),
   "lụm liền" (grab the opportunity immediately).
@@ -401,7 +477,7 @@ Detected language: Chinese (zh).
 
 When replying in Chinese:
 - Use friendly, casual Mandarin.
-- Understand basic internet slang like "哈哈哈", "可以哦", "稳了", "好扯", "太牛了".
+- Understand basic internet slang like "哈哈哈", "可以哦", "稳了", "太牛了".
 - Sound like a close friend, not a therapist.
 """
     if language == "ko":
@@ -410,7 +486,7 @@ Detected language: Korean (ko).
 
 When replying in Korean:
 - Use casual but respectful style suitable for uni students.
-- Understand common slang like "대박", "헐", "ㅋㅋㅋ", "미쳤다" (as excitement).
+- Understand common slang like "대박", "헐", "ㅋㅋㅋ", "미쳤다" used in a positive sense.
 """
     if language == "ja":
         return """
@@ -418,7 +494,7 @@ Detected language: Japanese (ja).
 
 When replying in Japanese:
 - Use friendly, casual style (but not rude).
-- Understand simple slang like "やばい", "マジで", "すごい", used in a positive sense.
+- Understand simple slang like "やばい", "マジで", "すごい" used in a positive sense.
 """
     return """
 Detected language: other or unknown.
@@ -433,12 +509,17 @@ def build_joy_block(language: str, joy_mode: bool) -> str:
 
     if language == "vi":
         return """
-The user is sharing clearly positive news with low risk (Vietnamese).
+The user is sharing clearly positive news with low risk and the conversation
+is in Vietnamese.
 
 Joy mode instructions:
 - Respond exactly like a close Vietnamese friend (Southern casual style is OK).
 - Tone: very warm, excited, funny and friendly.
-- Use expressions like: "Trời ơi, chúc mừng nha!", "Ghê vậy trời!", "Quá dữ luôn á!", "Vui giùm luôn đó!".
+- Use expressions like:
+  "Trời ơi, chúc mừng nha!",
+  "Ghê vậy trời!",
+  "Quá dữ luôn á!",
+  "Vui giùm luôn đó!".
 - You MAY ask ONE playful follow-up question such as "Giờ tính ăn mừng sao nè?".
 - Absolutely DO NOT:
   - suggest CBT, journaling, breathing, reflection
@@ -448,49 +529,66 @@ Joy mode instructions:
 
     if language == "en":
         return """
-The user is sharing clearly positive news with low risk (English).
+The user is sharing clearly positive news with low risk and the conversation
+is in English.
 
 Joy mode instructions:
 - Respond like a close uni friend (Aussie style is OK).
 - Tone: warm, excited, relaxed.
-- You can use light slang such as "Congrats mate, that's awesome!", "I'm so stoked for you!", "You're a legend!".
-- You MAY ask ONE playful follow-up question such as "So how are you going to celebrate?".
+- You can use light slang such as:
+  "Congrats mate, that's awesome!",
+  "I'm so stoked for you!",
+  "You're a legend!".
+- You MAY ask ONE playful follow-up question such as
+  "So how are you going to celebrate?".
 - Do NOT bring up CBT or wellbeing techniques.
 - Do NOT mention support services in this message.
 """
 
     if language == "zh":
         return """
-The user is sharing clearly positive news with low risk (Chinese).
+The user is sharing clearly positive news with low risk and the conversation
+is in Chinese.
 
 Joy mode instructions:
 - Respond like a close Chinese-speaking friend.
 - Tone: warm, excited, casual.
-- You can use expressions like "哇，太厉害了！", "恭喜恭喜！", "真的很为你开心！".
+- You can use expressions like:
+  "哇，太厉害了！",
+  "恭喜恭喜！",
+  "真的很为你开心！".
 - You MAY ask one light follow-up question about how they will celebrate.
 - Do NOT mention wellbeing techniques or support services in this message.
 """
 
     if language == "ko":
         return """
-The user is sharing clearly positive news with low risk (Korean).
+The user is sharing clearly positive news with low risk and the conversation
+is in Korean.
 
 Joy mode instructions:
 - Respond like a close Korean friend.
 - Tone: warm, excited, casual.
-- You can use expressions like "와, 대박이다!", "진짜 축하해!", "너무 잘했다!".
+- You can use expressions like:
+  "와, 대박이다!",
+  "진짜 축하해!",
+  "너무 잘했다!".
 - You MAY ask one light follow-up question about celebration.
 - Do NOT mention wellbeing techniques or support services in this message.
 """
 
     if language == "ja":
         return """
-The user is sharing clearly positive news with low risk (Japanese).
+The user is sharing clearly positive news with low risk and the conversation
+is in Japanese.
 
 Joy mode instructions:
 - Respond like a close Japanese friend.
 - Tone: warm, excited, casual.
-- You can use expressions like "うわ、すごいね！", "おめでとう！", "自分のことみたいに嬉しい！".
+- You can use expressions like:
+  "うわ、すごいね！",
+  "おめでとう！",
+  "自分のことみたいに嬉しい！".
 - You MAY ask one light follow-up question.
 - Do NOT mention wellbeing techniques or support services in this message.
 """
@@ -518,16 +616,44 @@ def run_response_agent(
     style_hint: str,
 ) -> str:
 
+    # Language from insight or fallback
     language = insights.get("language") or detect_language_fallback(req.message)
-    joy_mode = bool(insights.get("positive_event") and insights.get("risk_level") == "low")
+
+    # Joy Sticky: check whole conversation context for celebration flow
+    all_msgs: List[ChatMessage] = list(req.history) + [
+        ChatMessage(role="user", content=req.message)
+    ]
+    celebration_flow = is_celebration_context(all_msgs)
+
+    # Base joy mode from insight (single turn)
+    joy_mode_from_insight = bool(
+        insights.get("positive_event") and insights.get("risk_level") == "low"
+    )
+
+    # Final joy mode: either explicit positive_event OR celebration context with low risk
+    risk_level = insights.get("risk_level")
+    joy_mode = bool(
+        joy_mode_from_insight
+        or (celebration_flow and (risk_level in [None, "low"]))
+    )
 
     language_block = build_language_block(language)
     joy_block = build_joy_block(language, joy_mode)
 
-    effective_risk = safety.get("override_risk_level") or insights.get("risk_level")
+    effective_risk = safety.get("override_risk_level") or risk_level
 
     msg_low = req.message.lower()
-    emotional_keywords = ["stress", "lo lắng", "buồn", "sad", "anxious", "căng thẳng"]
+    emotional_keywords = [
+        "stress",
+        "lo lắng",
+        "lo lang",
+        "buồn",
+        "buon",
+        "sad",
+        "anxious",
+        "căng thẳng",
+        "cang thang",
+    ]
 
     add_support = False
     if effective_risk in ["medium", "high"]:
@@ -537,6 +663,7 @@ def run_response_agent(
     if safety.get("escalate"):
         add_support = True
 
+    # In joy mode, never add support block
     if joy_mode:
         add_support = False
 
@@ -544,7 +671,8 @@ def run_response_agent(
 
     system_content = (
         BASE_SYSTEM_PROMPT
-        + "\n\nCurrent language code: " + str(language)
+        + "\n\nCurrent language code: "
+        + str(language)
         + "\n\n"
         + language_block
         + "\n"
@@ -579,7 +707,9 @@ def run_response_agent(
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="Wellbeing Agent - 7 Agents, Multilingual Joy Mode with Slang")
+app = FastAPI(
+    title="Wellbeing Agent - 7 Agents, Context-aware Joy Sticky, Multilingual Slang"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -596,7 +726,7 @@ def chat(req: ChatRequest):
     student_id = req.student_id or "anonymous"
     logger.info("Incoming from %s: %r", student_id, req.message)
 
-    insights = run_insight_agent(req.message)
+    insights = run_insight_agent(req.message, req.history)
     profile = run_profile_agent(student_id, insights)
     trend = run_trend_agent(student_id, insights, req.history)
     interventions = run_intervention_agent(insights, trend, req.message)
