@@ -296,10 +296,23 @@ Return ONLY the suggestion text, or an EMPTY string if not appropriate.
 
 
 # ============================================================
-# AGENT 5 - Safety Agent (includes relationship violence)
+# AGENT 5 - Safety Agent (separate self-harm vs violence)
 # ============================================================
 def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
-    base = {"escalate": False, "reason": "", "override_risk_level": None}
+    """
+    Simple keyword-based safety layer.
+    We explicitly split:
+    - self_harm
+    - relationship / physical violence
+    - generic high risk from insights
+    """
+    base = {
+        "escalate": False,
+        "reason": "",
+        "override_risk_level": None,
+        "self_harm": False,
+        "violence": False,
+    }
 
     msg = message.lower()
     danger_keywords = [
@@ -311,9 +324,6 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
         "end my life",
         "suicide",
         "hurt myself",
-        "giết người",
-        "giet nguoi",
-        "kill someone",
     ]
 
     relationship_violence = [
@@ -338,25 +348,34 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
         "he punched me",
     ]
 
+    # Self-harm
     if any(kw in msg for kw in danger_keywords):
         return {
             "escalate": True,
-            "reason": "Self-harm or harm-others keywords detected",
+            "reason": "Self-harm keywords detected",
             "override_risk_level": "high",
+            "self_harm": True,
+            "violence": False,
         }
 
+    # Physical / relationship violence
     if any(kw in msg for kw in relationship_violence):
         return {
             "escalate": True,
-            "reason": "Relationship violence detected",
+            "reason": "Relationship / physical violence detected",
             "override_risk_level": "high",
+            "self_harm": False,
+            "violence": True,
         }
 
+    # Generic high risk from insight (no violence keywords)
     if insights.get("risk_level") == "high":
         return {
             "escalate": True,
             "reason": "Insight agent assessed high risk",
             "override_risk_level": "high",
+            "self_harm": False,
+            "violence": False,
         }
 
     return base
@@ -589,19 +608,22 @@ def build_emotion_block(
 ) -> str:
     """
     Give extra instructions to the response model for:
-    - high-risk / violence / abuse
+    - high-risk (self-harm / violence / generic)
     - deep sadness / heartbreak
-    so that it replies giống vibe bạn muốn.
     """
     emotion = str(insights.get("emotion") or "").lower()
     risk_level = (safety.get("override_risk_level") or insights.get("risk_level") or "low").lower()
     escalate = bool(safety.get("escalate"))
+    is_violence = bool(safety.get("violence"))
+    is_self_harm = bool(safety.get("self_harm"))
 
-    # High-risk or clear violence / abuse
+    # ---------------- HIGH RISK BRANCHES ----------------
     if risk_level == "high" or escalate:
-        if language == "vi":
-            return """
-Current situation: serious safety / violence / abuse / high risk.
+        # 1) Relationship / physical violence
+        if is_violence:
+            if language == "vi":
+                return """
+Current situation: relationship / physical violence, high risk.
 
 In this reply, you MUST:
 - Speak in very empathetic, gentle Vietnamese, like a close friend.
@@ -620,9 +642,9 @@ In this reply, you MUST:
   + Giảm nhẹ mức độ nghiêm trọng.
 - Keep sentences short, warm, and easy to read.
 """
-        elif language == "en":
-            return """
-Current situation: serious safety / violence / abuse / high risk.
+            elif language == "en":
+                return """
+Current situation: relationship / physical violence, high risk.
 
 In this reply, you MUST:
 - Speak in very empathetic, gentle English, like a close uni friend.
@@ -639,9 +661,9 @@ In this reply, you MUST:
 - Do NOT minimise the situation or blame the student.
 - Keep your sentences short, warm, and clear.
 """
-        else:
-            return """
-Current situation: serious safety / violence / abuse / high risk.
+            else:
+                return """
+Current situation: relationship / physical violence, high risk.
 
 In this reply, you MUST:
 - Be very empathetic and gentle, like a close friend.
@@ -651,12 +673,95 @@ In this reply, you MUST:
 - Do not minimise the situation or blame the student.
 """
 
-    # Deep sadness / heartbreak / emotional pain (but not high risk)
+        # 2) Self-harm risk (no violence keywords)
+        if is_self_harm:
+            if language == "vi":
+                return """
+Current situation: possible self-harm, high risk.
+
+In this reply (Vietnamese):
+- Nói với giọng rất nhẹ nhàng, chậm, giống một người bạn thân đang lo cho họ.
+- Công nhận cảm xúc tuyệt vọng / mệt mỏi của bạn ấy, không phán xét.
+- Nhấn mạnh:
+  + "Bạn rất quan trọng."
+  + "Cảm xúc của bạn đáng được lắng nghe."
+- Hỏi một cách đơn giản:
+  "Bây giờ bạn đang ở đâu? Ở đó có ai mà bạn tin tưởng không?"
+- Khuyến khích họ:
+  + Liên hệ người thân / bạn bè / dịch vụ hỗ trợ.
+- Không bao giờ cổ vũ hoặc bình thường hóa việc tự làm hại bản thân.
+"""
+            elif language == "en":
+                return """
+Current situation: possible self-harm, high risk.
+
+In this reply (English):
+- Speak slowly, gently, like a close friend who genuinely worries about them.
+- Validate their feelings of exhaustion or hopelessness without judging.
+- Emphasise:
+  + "You matter."
+  + "Your feelings are important."
+- Ask gently:
+  "Where are you right now? Is there someone you trust near you?"
+- Encourage them to reach out to friends, family, or professional support.
+- Never encourage or normalise self-harm.
+"""
+            else:
+                return """
+Current situation: possible self-harm, high risk.
+
+In this reply:
+- Be very gentle and caring.
+- Validate their difficult feelings and remind them that they matter.
+- Ask if there is someone they trust nearby.
+- Encourage them to reach out for support.
+"""
+
+        # 3) Generic high risk (no explicit violence / self-harm keywords)
+        if language == "vi":
+            return """
+Current situation: high emotional risk (very overwhelmed / distressed), but
+no explicit physical violence keywords.
+
+In this reply:
+- Nói như một người bạn thân đang rất lo cho họ.
+- Công nhận cảm xúc mệt mỏi, bế tắc, hoặc quá tải là thật và nghiêm túc.
+- Hỏi nhẹ:
+  "Bây giờ bạn đang ở đâu? Có ai quanh bạn mà bạn tin tưởng không?"
+- Gợi ý tìm đến người đáng tin (bạn thân, người nhà, dịch vụ hỗ trợ) nếu thấy quá khó.
+- Không giảng đạo lý, không xem nhẹ nỗi đau của họ.
+"""
+        elif language == "en":
+            return """
+Current situation: high emotional risk (very overwhelmed / distressed),
+but no explicit physical violence keywords.
+
+In this reply:
+- Speak like a close friend who is genuinely worried.
+- Acknowledge that feeling overwhelmed or stuck is serious and valid.
+- Ask gently:
+  "Where are you right now? Is there someone you trust around you?"
+- Suggest reaching out to someone they trust or a support service if it feels too much.
+- Do not minimise their feelings or lecture them.
+"""
+        else:
+            return """
+Current situation: high emotional risk.
+
+In this reply:
+- Be very warm and caring.
+- Validate that their distress is real and serious.
+- Gently ask if they are in a safe place and if someone they trust is nearby.
+- Encourage them to reach out for support.
+"""
+
+    # ---------------- DEEP SADNESS / HEARTBREAK ----------------
     sad_like = ["sad", "sadness", "worry", "stress", "anxiety", "anxious"]
     if any(e in emotion for e in sad_like):
         if language == "vi":
             return """
-The student is feeling very sad / hurt (for example bị bồ đá, thất tình, cô đơn).
+The student is feeling very sad / hurt (for example bị bồ đá, thất tình, cô đơn,
+hoặc bị la mắng nhiều, cảm thấy không được hiểu).
 
 For this reply in Vietnamese:
 - Talk like a close friend who really hiểu và thương.
@@ -908,8 +1013,19 @@ def run_response_agent(
     # ----------------------------------------------------
 
     language_block = build_language_block(language)
-    joy_block = build_joy_block(language, joy_mode)
     emotion_block = build_emotion_block(insights, safety, language)
+    joy_block = build_joy_block(language, joy_mode)
+
+    # ----------------------------------------------------
+    # Check last assistant reply to avoid "parrot" support spam
+    # ----------------------------------------------------
+    last_assistant_text = ""
+    for m in reversed(req.history):
+        if m.role == "assistant":
+            last_assistant_text = m.content or ""
+            break
+
+    already_has_support = "University of Adelaide – Student Wellbeing Support" in last_assistant_text
 
     # Decide whether to add support block
     emotional_keywords = [
@@ -926,6 +1042,8 @@ def run_response_agent(
         "cang thang",
         "cô đơn",
         "co don",
+        "bỏ nhà đi",
+        "bo nha di",
     ]
 
     add_support = False
@@ -940,6 +1058,10 @@ def run_response_agent(
     if joy_mode:
         add_support = False
         interventions = ""
+
+    # Nếu đã gửi support block ở message trước rồi thì không gửi lại nữa
+    if already_has_support:
+        add_support = False
 
     # Build support_instruction (smooth intro + block)
     support_instruction = ""
@@ -1040,7 +1162,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - V7 Safety + Emotion + Joy Sticky + Identity Lock + Adelaide Support + UniGate"
+    title="Wellbeing Agent - V8 Safety+Emotion+Joy Sticky+Identity Lock+Adelaide Support+UniGate+NoParrot"
 )
 
 app.add_middleware(
