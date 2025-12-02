@@ -63,10 +63,7 @@ class ChatResponse(BaseModel):
 
 # ============================================================
 # AGENT 1 – INSIGHT AGENT
-# - emotion
-# - risk_level
-# - positive_event
-# - topics
+# emotion, risk_level, positive_event, topics
 # ============================================================
 def run_insight_agent(message: str) -> Dict[str, Any]:
     prompt = f"""
@@ -106,7 +103,7 @@ Message:
 
 # ============================================================
 # AGENT 2 – PROFILE AGENT
-# - Tóm tắt trạng thái hiện tại (2–3 câu)
+# Tóm tắt trạng thái hiện tại (2–3 câu, internal)
 # ============================================================
 def run_profile_agent(student_id: str, insights: Dict[str, Any]) -> str:
     prompt = f"""
@@ -135,16 +132,11 @@ Insights: {insights}
 
 
 # ============================================================
-# AGENT 3 – RISK TREND AGENT
-# (Ở đây không có DB, nên trend chỉ dựa vào history hiện tại)
-# - trend: "unknown" / "stable" / "worsening" / "improving"
+# AGENT 3 – RISK TREND AGENT (simple, no DB)
+# trend: unknown / stable / worsening / improving
 # ============================================================
 def run_trend_agent(student_id: str, insights: Dict[str, Any], history: List[ChatMessage]) -> Dict[str, Any]:
-    """
-    Đơn giản: nhìn qua history trên UI hiện tại để đoán trend.
-    Nếu sau này bạn thêm DB, có thể thay thế agent này bằng bản đọc nhiều session.
-    """
-    history_text = "\n".join([f"{m.role}: {m.content}" for m in history[-8:]])  # lấy 8 lượt gần nhất
+    history_text = "\n".join([f"{m.role}: {m.content}" for m in history[-8:]])
 
     prompt = f"""
 You are the Risk Trend Agent.
@@ -181,9 +173,13 @@ Recent history:
 
 # ============================================================
 # AGENT 4 – INTERVENTION AGENT
-# - Gợi ý 0–2 "mini-exercises"
+# Gợi ý 0–2 mini-exercises (trừ khi positive_event low risk)
 # ============================================================
 def run_intervention_agent(insights: Dict[str, Any], trend: Dict[str, Any], message: str) -> str:
+    # FIX: Nếu là tin vui & risk thấp → KHÔNG gợi ý CBT/bài tập gì hết
+    if insights.get("positive_event") and insights.get("risk_level") == "low":
+        return ""
+
     prompt = f"""
 You are the Intervention Recommender Agent for a wellbeing system.
 
@@ -197,7 +193,8 @@ Task:
   suggest 1–2 VERY SMALL, PRACTICAL exercises the student could try
   (e.g., a 1-minute breathing exercise, a short grounding practice, a tiny journaling task).
 - If risk_level is high, keep the suggestion extremely gentle and simple, and only if appropriate.
-- If this is a positive/celebration message, you may suggest 1 small way to savour or celebrate.
+- If this is a positive/celebration message, you may suggest 1 small way to savour or celebrate,
+  but avoid sounding clinical.
 - If the message is just informational or neutral, you may return an empty suggestion.
 
 Output:
@@ -217,14 +214,14 @@ Message: {message}
 
 # ============================================================
 # AGENT 5 – SAFETY & ESCALATION AGENT
-# - Bắt các trường hợp self-harm / harm others
+# Bắt self-harm / harm others
 # ============================================================
 def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Trả về:
+    Output:
     - "escalate": bool
     - "reason": short text
-    - "override_risk_level": optional "medium"/"high"/null
+    - "override_risk_level": optional "medium"/"high"/None
     """
     base = {
         "escalate": False,
@@ -233,7 +230,6 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     msg_low = message.lower()
-    # Một số từ khoá rất thô sơ, bạn có thể mở rộng thêm
     danger_keywords = [
         "tự tử", "tự sát", "kết thúc cuộc đời", "không muốn sống nữa",
         "kill myself", "end my life", "suicide", "hurt myself",
@@ -245,7 +241,6 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
         base["override_risk_level"] = "high"
         return base
 
-    # Nếu insight đã là high thì cũng đánh dấu escalate (nhưng mềm hơn)
     if insights.get("risk_level") == "high":
         base["escalate"] = True
         base["reason"] = "Insight agent assessed high risk."
@@ -256,7 +251,7 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
 
 # ============================================================
 # AGENT 6 – STYLE / PERSONA AGENT
-# - Ước lượng style mà user hợp (ngắn/dài, casual/formal, mềm/cứng)
+# Ước lượng style phù hợp với user
 # ============================================================
 def run_style_agent(student_id: str, history: List[ChatMessage], insights: Dict[str, Any]) -> str:
     recent_user_msgs = "\n".join(
@@ -266,7 +261,7 @@ def run_style_agent(student_id: str, history: List[ChatMessage], insights: Dict[
 You are the Style/Persona Agent.
 
 You see:
-- student pseudo ID
+- a student pseudo ID
 - a few recent user messages
 - current insights
 
@@ -317,8 +312,10 @@ SUPPORT RULES (STRICT):
 - DO NOT provide support info for simple definition/explanation requests.
 
 GOOD NEWS RULES:
-- If the student shares positive news, respond joyfully, naturally, and like a friendly human.
-- Keep it light and short, avoid clinical analysis unless they ask.
+- If the student shares positive news, respond joyfully, tự nhiên, như một người bạn thân đang ăn mừng cùng họ.
+- KHÔNG đưa ra bài tập, journaling, self-reflection, hay gợi ý thực hành CBT trong tình huống chỉ thuần túy là ăn mừng.
+- Không phân tích cảm xúc sâu hoặc “tâm lý hóa” vấn đề, trừ khi họ tự hỏi hoặc chủ động xin gợi ý.
+- Giữ câu trả lời ngắn gọn, vui, ấm áp, có thể hỏi thêm 1–2 câu nhỏ về kế hoạch ăn mừng.
 
 NEGATIVE EMOTION RULES:
 - Validate feelings gently.
@@ -334,7 +331,7 @@ NEVER:
 
 # ============================================================
 # AGENT 7 – RESPONSE AGENT (FINAL REPLY)
-# - dùng tất cả thông tin từ 1–6
+# dùng tất cả thông tin từ 1–6
 # ============================================================
 def run_response_agent(
     req: ChatRequest,
@@ -346,16 +343,27 @@ def run_response_agent(
     style_hint: str,
 ) -> str:
 
-    # Xử lý Joy Mode
+    # JOY MODE – ép trả lời kiểu bạn thân khi tin vui
     joy_boost = ""
     if insights.get("positive_event"):
         joy_boost = """
-The user is sharing GOOD NEWS / a positive event.
-Respond with a joyful, friendly, light tone.
-Do NOT be clinical. Celebrate warmly with them.
+The user is sharing GOOD NEWS.
+For this message, you MUST respond like a close Vietnamese friend celebrating with them.
+
+TONE REQUIREMENTS (STRICT):
+- Very warm, excited, natural, friendly, human tone.
+- If the user writes in Vietnamese, use simple, natural Vietnamese expressions,
+  e.g. "Trời ơi, chúc mừng nha!", "Ghê vậy trời!", "Quá dữ luôn á!", "Vui giùm luôn đó!".
+- Celebrate big, react naturally as if you are genuinely happy for them.
+- Keep it FUN, SHORT, and LIGHT.
+- DO NOT suggest journaling, CBT exercises, breathing, reflection, or any therapeutic tools.
+- DO NOT analyse emotions.
+- DO NOT mention wellbeing support services.
+- DO NOT sound like a counsellor or teacher.
+- You may ask ONE playful follow-up question (e.g., "Giờ tính ăn mừng sao nè?").
 """
 
-    # Xử lý risk level với safety override
+    # Risk với safety override
     effective_risk = safety.get("override_risk_level") or insights.get("risk_level")
 
     # Có chèn Adelaide support hay không?
@@ -373,9 +381,13 @@ Do NOT be clinical. Celebrate warmly with them.
     if safety.get("escalate"):
         add_support = True
 
+    # Nhưng nếu là tin vui → luôn KHÔNG chèn support, bất kể risk thấp
+    if insights.get("positive_event") and effective_risk == "low":
+        add_support = False
+
     support_block = ADELAIDE_SUPPORT if add_support else ""
 
-    # Nếu có safety escalate thì nhắc rõ trong system prompt
+    # Safety block
     safety_block = ""
     if safety.get("escalate"):
         safety_block = f"""
@@ -388,7 +400,7 @@ Guidelines:
 - Emphasise contacting real-world support and crisis services.
 """
 
-    # Nếu có intervention gợi ý thì đưa cho assistant như hint
+    # Intervention suggestions (chỉ dùng nếu có, và không phải tin vui low risk)
     interventions_block = ""
     if interventions:
         interventions_block = f"""
@@ -423,11 +435,9 @@ STYLE HINT for this student:
         {"role": "system", "content": support_block},
     ]
 
-    # Thêm history
     for m in req.history:
         messages.append({"role": m.role, "content": m.content})
 
-    # Thêm message hiện tại
     messages.append({"role": "user", "content": req.message})
 
     completion = groq_client.chat.completions.create(
@@ -442,11 +452,11 @@ STYLE HINT for this student:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="Wellbeing Agent – 7-Agent Pipeline")
+app = FastAPI(title="Wellbeing Agent – 7-Agent Pipeline (Friend Joy Mode)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # dev: mở, sau này khóa lại domain UI cũng được
+    allow_origins=["*"],   # dev cho tiện, sau này khoá domain UI cũng được
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
