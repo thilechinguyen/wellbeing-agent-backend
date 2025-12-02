@@ -252,32 +252,45 @@ Recent history:
 
 
 # ============================================================
-# AGENT 4 - Intervention Agent
+# AGENT 4 - Intervention Agent (CBT OFF for positive / neutral)
 # ============================================================
 def run_intervention_agent(insights: Dict[str, Any], trend: Dict[str, Any], message: str) -> str:
-    # Skip for clearly positive events with low risk
+    """
+    Only suggest tiny interventions when the student is clearly
+    sad / stressed / anxious / overwhelmed.
+
+    Never respond for positive or neutral messages.
+    """
+
+    # If this is a positive event with low risk -> absolutely no CBT
     if insights.get("positive_event") and insights.get("risk_level") == "low":
         return ""
 
-    prompt = f"""
+    # If emotion is joy or neutral -> also skip
+    if insights.get("emotion") in ["joy", "neutral"]:
+        return ""
+
+    prompt = """
 You are the Intervention Agent.
 
-If the student's message shows stress, sadness, worry, or feeling down:
-- Suggest 1-2 very small, practical exercises (for example a 1-minute
-  breathing exercise, a short grounding practice, or a tiny journaling task).
-- Keep it at most 2 sentences.
+ONLY respond if the student is sad, stressed, anxious, overwhelmed, or hurting.
+If you are not sure, respond with an EMPTY string.
 
-If the message is neutral or only informational, or you are not sure,
-return an empty string.
+When you do respond:
+- Suggest 1 very small, practical thing (for example a 1-minute breathing,
+  a short grounding practice, or a tiny self-kindness action).
+- Keep it under 2 short sentences.
+- Do NOT mention university services (another agent handles that).
 
-Insights: {insights}
-Trend: {trend}
-Message: {message}
+Return ONLY the suggestion text, or an EMPTY string if not appropriate.
 """
     completion = groq_client.chat.completions.create(
         model=MODEL_ID,
-        messages=[{"role": "system", "content": prompt}],
-        temperature=0.4,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": message},
+        ],
+        temperature=0.3,
     )
     return completion.choices[0].message.content.strip()
 
@@ -547,8 +560,8 @@ is in Vietnamese.
 
 JOY STICKY RULES (very important):
 - This is NOT only for the first reply. As long as the student keeps
-  talking about this good news (for example scholarship, trúng số,
-  ăn mừng, đi chơi, mua gì để thưởng cho bản thân), you MUST stay
+  talking about this good news (for example scholarship, "trúng số",
+  "ăn mừng", đi chơi, mua gì để thưởng cho bản thân), you MUST stay
   in the same joyful friend mode across the following turns.
 - Only when the student later shows clear sadness, stress, or violence,
   you may switch out of joy mode.
@@ -699,9 +712,8 @@ def run_response_agent(
     risk_level = insights.get("risk_level")
     msg_low = req.message.lower()
 
-    # JOY STICKY V2 LOGIC
-    celebration_flow = is_celebration_context(all_msgs)
-    joy_single_turn = bool(insights.get("positive_event") and risk_level == "low")
+    # Effective risk (safety override if any)
+    effective_risk = safety.get("override_risk_level") or risk_level
 
     negative_break_keywords = [
         "buồn",
@@ -730,22 +742,23 @@ def run_response_agent(
         "tu sat",
     ]
 
-    forced_joy_off = any(kw in msg_low for kw in negative_break_keywords)
+    # ---------------- JOY STICKY FLOW V3 ----------------
+    celebration_flow = is_celebration_context(all_msgs)
+    joy_one_shot = bool(insights.get("positive_event") and risk_level == "low")
+    joy_mode = bool(celebration_flow or joy_one_shot)
 
-    if forced_joy_off or risk_level in ["medium", "high"]:
+    # Turn off joy if risk is not low or if strong negative words appear
+    if effective_risk in ["medium", "high"]:
         joy_mode = False
-    else:
-        # Joy if:
-        # - conversation context clearly celebration, OR
-        # - single-turn positive_event low-risk
-        joy_mode = bool(celebration_flow or joy_single_turn)
+
+    if any(kw in msg_low for kw in negative_break_keywords):
+        joy_mode = False
+    # ----------------------------------------------------
 
     language_block = build_language_block(language)
     joy_block = build_joy_block(language, joy_mode)
 
     # Decide whether to add support block
-    effective_risk = safety.get("override_risk_level") or risk_level
-
     emotional_keywords = [
         "stress",
         "lo lắng",
@@ -770,9 +783,10 @@ def run_response_agent(
     if safety.get("escalate"):
         add_support = True
 
-    # In joy mode, never add support block
+    # In joy mode, never add support block and never use interventions
     if joy_mode:
         add_support = False
+        interventions = ""
 
     # Force the model to append Adelaide support block at the END
     support_instruction = ""
@@ -806,7 +820,7 @@ Support block (University of Adelaide):
         {"role": "system", "content": f"Internal intervention suggestions:\n{interventions}"},
     ]
 
-    # Nếu cần hỗ trợ thì thêm system message bắt buộc chèn block
+    # If we need support, add extra system instruction
     if support_instruction:
         messages.append({"role": "system", "content": support_instruction})
 
@@ -828,7 +842,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - 7 Agents, Joy Sticky Flow Fix V2, Violence Safety, Adelaide Support"
+    title="Wellbeing Agent - 7 Agents, Joy Sticky Flow V3, Violence Safety, Adelaide Support"
 )
 
 app.add_middleware(
