@@ -1,265 +1,228 @@
 import os
 import logging
-from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from dotenv import load_dotenv
 from groq import Groq
 
-# Local modules
-from export_data import (
-    load_messages,
-    export_csv,
-    export_pdf,
-    EXPORT_DIR,
-    CSV_PATH,
-)
-
-from conversation_logging import (
-    init_db,
-    log_turn,
-    attach_export_routes,
-)
-
-# ============================================================
-# 1. Load environment variables (.env)
-# ============================================================
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-
-# ============================================================
-# 2. Logging
-# ============================================================
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wellbeing-backend")
 
-# ============================================================
-# 3. Environment variables
-# ============================================================
+# Environment
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL_ID = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
 if not GROQ_API_KEY:
-    raise RuntimeError("❌ GROQ_API_KEY is not set in .env")
+    raise RuntimeError("GROQ_API_KEY is not set")
 
-client = Groq(api_key=GROQ_API_KEY)
+GROQ_MODEL_ID = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
 
-ALLOW_ORIGINS = os.getenv(
-    "ALLOW_ORIGINS",
-    "https://wellbeing-agent-ui.onrender.com,http://localhost:3000"
-).split(",")
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 # ============================================================
-# 4. FastAPI App
+# University of Adelaide Support Pack
 # ============================================================
-app = FastAPI(
-    title="Wellbeing Agent Backend (Groq Llama3.1-8B)"
-)
+ADELAIDE_SUPPORT = """
+University of Adelaide – Student Wellbeing Support
 
-init_db()
-attach_export_routes(app)
+• Counselling Support (free for all students)
+  https://www.adelaide.edu.au/counselling/
+
+• After-hours Crisis Line (5pm–9am weekdays, 24/7 weekends & holidays)
+  Phone: 1300 167 654
+  Text: 0488 884 197
+
+• Student Life Support
+  https://www.adelaide.edu.au/student/wellbeing
+
+• International Student Support
+  https://international.adelaide.edu.au/student-support
+
+• Emergency (Australia-wide)
+  Call 000 for urgent life-threatening emergencies.
+"""
+
+
+# ============================================================
+# Pydantic Models
+# ============================================================
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    student_id: Optional[str] = None
+    message: str
+    history: List[ChatMessage] = []
+
+class ChatResponse(BaseModel):
+    reply: str
+
+
+# ============================================================
+# AGENT 1 – INSIGHT AGENT
+# phân tích tin nhắn → risk level, emotions, topics
+# ============================================================
+def run_insight_agent(message: str) -> Dict[str, Any]:
+    prompt = f"""
+You are an Insight Extraction Agent for a wellbeing system.
+Analyse the student's message and extract:
+
+- emotion: one-word emotion (e.g., joy, sadness, worry, stress)
+- risk_level: low / medium / high
+- positive_event: true/false
+- topics: list of short tags (e.g., exam, loneliness, homesickness)
+
+Return ONLY valid JSON.
+
+Message:
+{message}
+"""
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL_ID,
+            messages=[{"role": "system", "content": prompt}],
+            temperature=0.2
+        )
+        import json
+        return json.loads(completion.choices[0].message.content)
+    except Exception as e:
+        logger.warning("Insight agent failed:", e)
+        return {
+            "emotion": "neutral",
+            "risk_level": "low",
+            "positive_event": False,
+            "topics": []
+        }
+
+
+# ============================================================
+# AGENT 2 – PROFILE AGENT
+# nhận insight + history → tạo profile summary
+# ============================================================
+def run_profile_agent(student_id: str, insights: Dict[str, Any]) -> str:
+    prompt = f"""
+You are the Profile Agent. Your job is to summarise the student's
+current wellbeing state from the extracted insights.
+
+Student ID: {student_id}
+
+Insights:
+{insights}
+
+Create a SHORT 2–3 sentence summary describing:
+- the student's emotional tone
+- the key concerns or topics
+- whether this is a positive-mood or negative-mood moment
+"""
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL_ID,
+        messages=[{"role": "system", "content": prompt}],
+        temperature=0.3
+    )
+    return completion.choices[0].message.content
+
+
+# ============================================================
+# BASE SYSTEM PROMPT for Agent 3 (Wellbeing Response Agent)
+# ============================================================
+BASE_SYSTEM_PROMPT = f"""
+You are a warm wellbeing companion for University of Adelaide students.
+You use CBT, Positive Psychology and supportive counselling skills,
+but you are *not* a therapist and never diagnose.
+
+You ALWAYS stay culturally sensitive and respond in the student's language.
+
+You also ALWAYS include, when appropriate, the following official support information:
+
+{ADELAIDE_SUPPORT}
+
+RULES FOR GOOD NEWS:
+- celebrate warmly
+- respond like a natural friend
+- light, joyful tone
+- avoid clinical analysis unless asked
+- keep it short and human
+
+RULES FOR STRESS/SADNESS:
+- validate feelings
+- be calm, soft, gentle
+- offer small practical next steps
+- provide counselling/crisis info ONLY if relevant
+
+NEVER:
+- give legal/financial/medical advice
+- promise confidentiality
+"""
+
+# ============================================================
+# AGENT 3 – WELLBEING RESPONSE AGENT
+# ============================================================
+def run_response_agent(req: ChatRequest, profile_summary: str, insights: Dict[str, Any]) -> str:
+
+    # Nếu là positive event → thêm tone vui
+    joy_boost = ""
+    if insights.get("positive_event"):
+        joy_boost = """
+The student is sharing GOOD NEWS.
+Respond in a happy, natural, uplifting tone.
+Do NOT be clinical. Celebrate with them warmly.
+"""
+
+    messages = [
+        {"role": "system", "content": BASE_SYSTEM_PROMPT + joy_boost},
+        {"role": "system", "content": f"Profile Summary:\n{profile_summary}"},
+    ]
+
+    for m in req.history:
+        messages.append({"role": m.role, "content": m.content})
+
+    messages.append({"role": "user", "content": req.message})
+
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL_ID,
+        messages=messages,
+        temperature=0.6,
+        max_tokens=1024
+    )
+    return completion.choices[0].message.content
+
+
+# ============================================================
+# FastAPI setup
+# ============================================================
+app = FastAPI(title="Wellbeing Agent – 3 Agent Pipeline")
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOW_ORIGINS],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ============================================================
-# 5. Routes: Export CSV + ZIP PDF
-# ============================================================
-@app.get("/export/csv")
-def export_csv_endpoint():
-    messages = load_messages()
-    if not messages:
-        raise HTTPException(404, "No data available")
-
-    export_csv(messages)
-
-    return FileResponse(
-        CSV_PATH,
-        media_type="text/csv",
-        filename="wellbeing_conversations.csv",
-    )
-
-
-@app.get("/export/report")
-def export_report_endpoint():
-    """
-    Sinh PDF (1 file/user_id) → trả về 1 file ZIP.
-    """
-    messages = load_messages()
-    if not messages:
-        raise HTTPException(404, "No messages found.")
-
-    export_pdf(messages)
-
-    reports_dir = EXPORT_DIR / "reports"
-    if not reports_dir.exists():
-        raise HTTPException(500, "Reports directory missing.")
-
-    # Tạo file zip tạm
-    import tempfile, shutil
-    tmp_dir = tempfile.mkdtemp()
-    zip_path = Path(tmp_dir) / "wellbeing_reports.zip"
-
-    shutil.make_archive(
-        base_name=str(zip_path.with_suffix("")),
-        format="zip",
-        root_dir=str(reports_dir),
-    )
-
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename="wellbeing_reports.zip",
-    )
-
-
-# ============================================================
-# 6. Models
-# ============================================================
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-
-    # Metadata được UI nhúng vào message, nhưng ta hỗ trợ thêm:
-    session_id: Optional[str] = None
-    turn_index: Optional[int] = None
-    lang_code: Optional[str] = "vi"
-
-    # Lưu cho DB
-    student_type: Optional[str] = "domestic"
-    student_region: Optional[str] = "au"
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    emotion_summary: str
-
-
-# ============================================================
-# 7. Prompts
-# ============================================================
-EMOTION_ANALYST_PROMPT = """
-You are an EMOTION ANALYST.
-Summarise in 3–4 short sentences:
-- Emotions
-- Intensity
-- Themes
-"""
-
-CBT_COACH_PROMPT = """
-You are a CBT wellbeing companion for first-year University of Adelaide students.
-
-Emotion summary:
-{emotion_summary}
-
-Rules:
-- Warm, validating, simple language.
-- Match student’s language.
-- Provide 2–4 realistic next steps.
-- Include UoA supports only if appropriate.
-- If distress → mention crisis line 1300 167 654 or text 0488 884 197.
-"""
-
-SAFETY_REVIEW_PROMPT = """
-Rewrite only if needed to make the reply safer.
-Never mention being an AI.
-Always keep the same language as the reply.
-Return ONLY the final text.
-"""
-
-
-# ============================================================
-# 8. Helper: Call Groq
-# ============================================================
-def call_groq(system, user):
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.4,
-            max_tokens=900,
-        )
-        return completion.choices[0].message.content.strip()
-    except Exception as e:
-        logger.exception(e)
-        raise HTTPException(500, f"Groq error: {e}")
-
-
-# ============================================================
-# 9. Health Check
-# ============================================================
-@app.get("/health")
-def health():
-    test = call_groq("Say 'ok'.", "Say ok.")
-    return {"status": "ok", "model": MODEL_ID, "llm": test}
-
-
-# ============================================================
-# 10. Main Chat Orchestrator
-# ============================================================
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
 
-    if not req.message.strip():
-        raise HTTPException(400, "Empty message")
+    student_id = req.student_id or "anonymous"
+    msg = req.message
 
-    # ---- Build profile text ----
-    profile = (
-        f"Student type: {req.student_type}. "
-        f"Region: {req.student_region}. "
-        "First-year University of Adelaide student."
-    )
+    # 1) INSIGHT AGENT
+    insights = run_insight_agent(msg)
 
-    # ---- 1) Emotion Analyst ----
-    emotion_summary = call_groq(
-        EMOTION_ANALYST_PROMPT,
-        f"{profile}\n\nMessage:\n{req.message}"
-    )
+    # 2) PROFILE AGENT
+    profile = run_profile_agent(student_id, insights)
 
-    # ---- 2) CBT Coach ----
-    coach_prompt = CBT_COACH_PROMPT.format(
-        emotion_summary=emotion_summary
-    )
+    # 3) RESPONSE AGENT (final answer)
+    reply = run_response_agent(req, profile, insights)
 
-    candidate_reply = call_groq(
-        coach_prompt,
-        f"{profile}\n\nMessage:\n{req.message}"
-    )
+    return ChatResponse(reply=reply)
 
-    # ---- 3) Safety Filter ----
-    final_reply = call_groq(
-        SAFETY_REVIEW_PROMPT,
-        f"Student message:\n{req.message}\n\nCandidate reply:\n{candidate_reply}"
-    )
 
-    # ---- 4) Save to DB ----
-    log_turn(
-        session_id=req.session_id,
-        turn_index=req.turn_index,
-        user_id=req.user_id,
-        user_text=req.message,
-        agent_text=final_reply,
-        emotion=emotion_summary,
-        safety=None,
-        supervisor=None,
-        lang_code=req.lang_code,
-    )
-
-    return ChatResponse(
-        reply=final_reply,
-        emotion_summary=emotion_summary,
-    )
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": GROQ_MODEL_ID}
