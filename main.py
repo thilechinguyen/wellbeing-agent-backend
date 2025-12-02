@@ -321,6 +321,12 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
         "danh em",
         "bị đánh",
         "bi danh",
+        "đánh tui",
+        "danh tui",
+        "anh đánh em",
+        "anh danh em",
+        "anh đánh tui",
+        "anh danh tui",
         "bạo lực",
         "bao luc",
         "hit me",
@@ -573,6 +579,126 @@ Follow the language used by the student and keep a friendly, simple tone.
 """
 
 
+# ============================================================
+# Emotion-specific block (Safety + deep empathy)
+# ============================================================
+def build_emotion_block(
+    insights: Dict[str, Any],
+    safety: Dict[str, Any],
+    language: str,
+) -> str:
+    """
+    Give extra instructions to the response model for:
+    - high-risk / violence / abuse
+    - deep sadness / heartbreak
+    so that it replies giống vibe bạn vừa demo.
+    """
+    emotion = str(insights.get("emotion") or "").lower()
+    risk_level = (safety.get("override_risk_level") or insights.get("risk_level") or "low").lower()
+    escalate = bool(safety.get("escalate"))
+
+    # High-risk or clear violence / abuse
+    if risk_level == "high" or escalate:
+        if language == "vi":
+            return """
+Current situation: serious safety / violence / abuse / high risk.
+
+In this reply, you MUST:
+- Speak in very empathetic, gentle Vietnamese, like a close friend.
+- First, acknowledge their pain and show that you care deeply.
+- Make it clear that:
+  + Không ai đáng bị đánh hoặc bị bạo lực.
+  + Đây không phải lỗi của bạn ấy.
+- Ask simple safety questions such as:
+  "Bây giờ bạn có đang ở nơi an toàn không?"
+  "Người đó có còn ở gần bạn hoặc có thể làm hại bạn nữa không?"
+- Encourage them to:
+  + Tìm sự an toàn ngay (bạn bè, gia đình, người đáng tin, nơi công cộng).
+  + Liên hệ dịch vụ hỗ trợ nếu cần.
+- Do NOT:
+  + Đổ lỗi cho bạn ấy.
+  + Giảm nhẹ mức độ nghiêm trọng.
+- Keep sentences short, warm, and easy to read.
+"""
+        elif language == "en":
+            return """
+Current situation: serious safety / violence / abuse / high risk.
+
+In this reply, you MUST:
+- Speak in very empathetic, gentle English, like a close uni friend.
+- First, validate their pain and show that you genuinely care.
+- Make it clear that:
+  + No one deserves to be hit, abused, or hurt.
+  + It is NOT their fault.
+- Ask simple safety questions such as:
+  "Are you in a safe place right now?"
+  "Is that person still around you or able to hurt you again?"
+- Encourage them to:
+  + Move to a safer place if needed.
+  + Reach out to trusted friends, family, or authorities.
+- Do NOT minimise the situation or blame the student.
+- Keep your sentences short, warm, and clear.
+"""
+        else:
+            return """
+Current situation: serious safety / violence / abuse / high risk.
+
+In this reply, you MUST:
+- Be very empathetic and gentle, like a close friend.
+- Validate the student's pain and make it clear it is not their fault.
+- Ask if they are safe right now and whether the person can still harm them.
+- Encourage them to seek immediate safety and contact trusted people or services.
+- Do not minimise the situation or blame the student.
+"""
+
+    # Deep sadness / heartbreak / emotional pain (but not high risk)
+    sad_like = ["sad", "sadness", "worry", "stress", "anxiety", "anxious"]
+    if any(e in emotion for e in sad_like):
+        if language == "vi":
+            return """
+The student is feeling very sad / hurt (for example bị bồ đá, thất tình, cô đơn).
+
+For this reply in Vietnamese:
+- Talk like a close friend who really hiểu và thương.
+- First, công nhận cảm xúc của bạn ấy: buồn, hụt hẫng, trống trải là bình thường.
+- Cho họ biết rằng nỗi đau này là thật và bạn tôn trọng cảm xúc đó.
+- Gợi ý nhẹ nhàng (không ép buộc) rằng nếu muốn, họ có thể kể thêm chuyện đã xảy ra.
+- Nếu phù hợp, bạn có thể nói:
+  "Nếu bây giờ bạn chỉ muốn được an ủi thôi cũng được, mình ở đây với bạn."
+- Không giảng đạo lý, không phán xét, không trách móc.
+- Giữ câu ngắn, ấm áp, dễ đọc, giống như người bạn thân đang nhắn tin.
+"""
+        elif language == "en":
+            return """
+The student is feeling very sad / heartbroken / emotionally hurt.
+
+For this reply in English:
+- Speak like a close uni friend who truly cares.
+- First, validate their feelings: sadness, emptiness, and pain are understandable.
+- Let them know that what they feel is real and it makes sense.
+- Gently invite them to share more if they want, but never pressure them.
+- You can offer comfort like:
+  "If you just want someone to be here with you for a bit, that's totally okay too."
+- Do NOT preach, judge, or blame.
+- Keep sentences short, warm, and easy to read.
+"""
+        else:
+            return """
+The student is feeling very sad / heartbroken.
+
+For this reply:
+- Respond like a close friend who genuinely cares.
+- Validate their feelings and let them know it is okay to feel this way.
+- Gently invite them to share more if they want, without pressure.
+- Keep it short, warm, and supportive.
+"""
+
+    return ""
+
+
+# ============================================================
+# Joy block
+# ============================================================
 def build_joy_block(language: str, joy_mode: bool) -> str:
     if not joy_mode:
         return ""
@@ -750,6 +876,8 @@ def run_response_agent(
         "bi danh",
         "đánh em",
         "danh em",
+        "đánh tui",
+        "danh tui",
         "bạo lực",
         "bao luc",
         "hurt me",
@@ -766,7 +894,7 @@ def run_response_agent(
         "tu sat",
     ]
 
-    # ---------------- JOY STICKY FLOW V4 ----------------
+    # ---------------- JOY STICKY FLOW V5 ----------------
     celebration_flow = is_celebration_context(all_msgs)
     joy_one_shot = bool(insights.get("positive_event") and risk_level == "low")
     joy_mode = bool(celebration_flow or joy_one_shot)
@@ -781,6 +909,7 @@ def run_response_agent(
 
     language_block = build_language_block(language)
     joy_block = build_joy_block(language, joy_mode)
+    emotion_block = build_emotion_block(insights, safety, language)
 
     # Decide whether to add support block
     emotional_keywords = [
@@ -832,6 +961,8 @@ Support block (University of Adelaide):
         + language_block
         + "\n"
         + joy_block
+        + "\n"
+        + emotion_block
         + "\nSTYLE HINT (internal):\n"
         + style_hint
         + "\n"
@@ -866,7 +997,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - 7 Agents, Joy Sticky Flow V4, Identity Lock, Violence Safety, Adelaide Support"
+    title="Wellbeing Agent - V5 Safety + Emotion + Joy Sticky + Identity Lock + Adelaide Support"
 )
 
 app.add_middleware(
@@ -887,8 +1018,8 @@ def chat(req: ChatRequest):
     insights = run_insight_agent(req.message, req.history)
     profile = run_profile_agent(student_id, insights)
     trend = run_trend_agent(student_id, insights, req.history)
-    interventions = run_intervention_agent(insights, trend, req.message)
     safety = run_safety_agent(req.message, insights)
+    interventions = run_intervention_agent(insights, trend, req.message)
     style_hint = run_style_agent(student_id, req.history, insights)
 
     reply = run_response_agent(
