@@ -84,10 +84,10 @@ def detect_language_fallback(message: str) -> str:
     # Default English
     return "en"
 
-
 # ============================================================
 # Adelaide support block
 # ============================================================
+
 ADELAIDE_SUPPORT = """
 University of Adelaide – Student Wellbeing Support
 
@@ -106,6 +106,26 @@ University of Adelaide – Student Wellbeing Support
 
 • Emergency (Australia-wide)
   Call 000 for urgent emergencies.
+"""
+
+support_instruction = f"""
+Because the student's risk is '{{effective_risk}}' or they expressed strong negative emotions:
+
+1) First, in the SAME LANGUAGE as the student, add 1–2 SHORT sentences that smoothly introduce
+   the idea of getting extra support from the university.
+   - For example in Vietnamese:
+     "Ngoài ra, nếu một lúc nào đó em cảm thấy cần thêm sự hỗ trợ chuyên nghiệp,
+     em hoàn toàn có thể liên hệ với các dịch vụ hỗ trợ của trường dưới đây."
+   - Or in English:
+     "If at any point you feel you’d like more professional support,
+     you can also reach out to the support services at uni below."
+
+2) Then, on the next lines, you MUST append the following support information block
+   at the END of your reply, after your own supportive message.
+   Do NOT translate or summarise this block, copy it exactly as-is.
+
+Support block (University of Adelaide):
+{ADELAIDE_SUPPORT}
 """
 
 
