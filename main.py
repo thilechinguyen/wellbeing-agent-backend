@@ -84,10 +84,10 @@ def detect_language_fallback(message: str) -> str:
     # Default English
     return "en"
 
+
 # ============================================================
 # Adelaide support block
 # ============================================================
-
 ADELAIDE_SUPPORT = """
 University of Adelaide – Student Wellbeing Support
 
@@ -106,26 +106,6 @@ University of Adelaide – Student Wellbeing Support
 
 • Emergency (Australia-wide)
   Call 000 for urgent emergencies.
-"""
-
-support_instruction = f"""
-Because the student's risk is '{{effective_risk}}' or they expressed strong negative emotions:
-
-1) First, in the SAME LANGUAGE as the student, add 1–2 SHORT sentences that smoothly introduce
-   the idea of getting extra support from the university.
-   - For example in Vietnamese:
-     "Ngoài ra, nếu một lúc nào đó em cảm thấy cần thêm sự hỗ trợ chuyên nghiệp,
-     em hoàn toàn có thể liên hệ với các dịch vụ hỗ trợ của trường dưới đây."
-   - Or in English:
-     "If at any point you feel you’d like more professional support,
-     you can also reach out to the support services at uni below."
-
-2) Then, on the next lines, you MUST append the following support information block
-   at the END of your reply, after your own supportive message.
-   Do NOT translate or summarise this block, copy it exactly as-is.
-
-Support block (University of Adelaide):
-{ADELAIDE_SUPPORT}
 """
 
 
@@ -611,7 +591,7 @@ def build_emotion_block(
     Give extra instructions to the response model for:
     - high-risk / violence / abuse
     - deep sadness / heartbreak
-    so that it replies giống vibe bạn vừa demo.
+    so that it replies giống vibe bạn muốn.
     """
     emotion = str(insights.get("emotion") or "").lower()
     risk_level = (safety.get("override_risk_level") or insights.get("risk_level") or "low").lower()
@@ -914,7 +894,7 @@ def run_response_agent(
         "tu sat",
     ]
 
-    # ---------------- JOY STICKY FLOW V5 ----------------
+    # ---------------- JOY STICKY FLOW ----------------
     celebration_flow = is_celebration_context(all_msgs)
     joy_one_shot = bool(insights.get("positive_event") and risk_level == "low")
     joy_mode = bool(celebration_flow or joy_one_shot)
@@ -961,13 +941,24 @@ def run_response_agent(
         add_support = False
         interventions = ""
 
-    # Force the model to append Adelaide support block at the END
+    # Build support_instruction (smooth intro + block)
     support_instruction = ""
     if add_support:
         support_instruction = f"""
-Because the student's risk is '{effective_risk}' or they expressed strong negative emotions,
-you MUST append the following support information block at the END of your reply,
-after your own supportive message. Do not translate or summarise this block, copy it as-is.
+Because the student's risk is '{effective_risk}' or they expressed strong negative emotions:
+
+1) First, in the SAME LANGUAGE as the student, add 1–2 SHORT sentences that smoothly introduce
+   the idea of getting extra support from the university.
+   - For example in Vietnamese:
+     "Ngoài ra, nếu một lúc nào đó em cảm thấy cần thêm sự hỗ trợ chuyên nghiệp,
+     em hoàn toàn có thể liên hệ với các dịch vụ hỗ trợ của trường dưới đây."
+   - Or in English:
+     "If at any point you feel you’d like more professional support,
+     you can also reach out to the support services at uni below."
+
+2) Then, on the next lines, you MUST append the following support information block
+   at the END of your reply, after your own supportive message.
+   Do NOT translate or summarise this block, copy it exactly as-is.
 
 Support block (University of Adelaide):
 {ADELAIDE_SUPPORT}
@@ -987,6 +978,38 @@ Support block (University of Adelaide):
         + style_hint
         + "\n"
     )
+
+    # ============================================================
+    # University context gating (không tự lôi chuyện về đại học)
+    # ============================================================
+    uni_keywords = [
+        "uni",
+        "university",
+        "campus",
+        "class",
+        "assignment",
+        "study",
+        "lecture",
+        "orientation",
+        "exam",
+        "tutorial",
+        "học",
+        "bài tập",
+        "trường",
+        "đại học",
+        "lớp",
+        "thi",
+        "kỳ thi",
+        "ky thi",
+    ]
+
+    force_uni_context = any(kw in msg_low for kw in uni_keywords)
+
+    if not force_uni_context:
+        system_content = system_content.replace(
+            "Even for neutral messages (not good news, not sad):",
+            "For neutral messages NOT related to university life:",
+        )
 
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_content},
@@ -1017,7 +1040,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - V5 Safety + Emotion + Joy Sticky + Identity Lock + Adelaide Support"
+    title="Wellbeing Agent - V7 Safety + Emotion + Joy Sticky + Identity Lock + Adelaide Support + UniGate"
 )
 
 app.add_middleware(
