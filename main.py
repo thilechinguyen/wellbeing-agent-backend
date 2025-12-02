@@ -23,6 +23,7 @@ MODEL_ID = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
+
 # ============================================================
 # JSON Extraction Helper (robust)
 # ============================================================
@@ -54,6 +55,33 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
 
     return None
 
+
+# ============================================================
+# Simple language fallback if agent does not return language
+# ============================================================
+def detect_language_fallback(message: str) -> str:
+    msg = message.lower()
+
+    # UI prefix, e.g. [lang=vi;...]
+    if "[lang=vi" in msg:
+        return "vi"
+    if "[lang=en" in msg:
+        return "en"
+    if "[lang=zh" in msg:
+        return "zh"
+    if "[lang=ko" in msg:
+        return "ko"
+    if "[lang=ja" in msg or "[lang=jp" in msg:
+        return "ja"
+
+    # Vietnamese diacritics
+    if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩị]", message):
+        return "vi"
+
+    # Default English
+    return "en"
+
+
 # ============================================================
 # Adelaide support block
 # ============================================================
@@ -77,6 +105,7 @@ University of Adelaide – Student Wellbeing Support
   Call 000 for urgent emergencies.
 """
 
+
 # ============================================================
 # Pydantic models
 # ============================================================
@@ -84,16 +113,19 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
+
 class ChatRequest(BaseModel):
     student_id: Optional[str] = None
     message: str
     history: List[ChatMessage] = []
 
+
 class ChatResponse(BaseModel):
     reply: str
 
+
 # ============================================================
-# AGENT 1 - Insight Agent
+# AGENT 1 - Insight Agent (with language)
 # ============================================================
 def run_insight_agent(message: str) -> Dict[str, Any]:
     prompt = f"""
@@ -102,12 +134,15 @@ You are the Insight Extraction Agent in a wellbeing system.
 Task:
 - Read the student's message.
 - Return ONLY a JSON object with the following keys:
-  - "emotion": one word such as "joy", "sadness", "worry", "stress", "anger", "neutral"
+  - "emotion": one word, for example "joy", "sadness", "worry", "stress", "anger", "neutral"
   - "risk_level": "low", "medium", or "high"
   - "positive_event": true or false
-  - "topics": a short list of 1-4 simple tags
+  - "topics": a short list of 1-4 simple tags (for example ["exam", "friends"])
+  - "language": main language code of the message, one of:
+      "vi" (Vietnamese), "en" (English), "zh" (Chinese),
+      "ko" (Korean), "ja" (Japanese), or "other"
 
-Do not include any explanation or extra text. Only output the JSON object.
+Do not include any explanation or extra text outside the JSON.
 
 Message:
 {message}
@@ -130,7 +165,9 @@ Message:
             "risk_level": "low",
             "positive_event": False,
             "topics": [],
+            "language": "other",
         }
+
 
 # ============================================================
 # AGENT 2 - Profile Agent
@@ -152,8 +189,9 @@ Insights: {insights}
     )
     return completion.choices[0].message.content
 
+
 # ============================================================
-# AGENT 3 - Trend Agent (simple, from history)
+# AGENT 3 - Trend Agent
 # ============================================================
 def run_trend_agent(student_id: str, insights: Dict[str, Any], history: List[ChatMessage]) -> Dict[str, Any]:
     history_text = "\n".join([f"{m.role}: {m.content}" for m in history[-6:]])
@@ -190,11 +228,12 @@ Recent history:
         logger.warning("Trend agent failed: %s", e)
         return {"trend": "unknown", "rationale": "Not enough reliable data"}
 
+
 # ============================================================
 # AGENT 4 - Intervention Agent
 # ============================================================
 def run_intervention_agent(insights: Dict[str, Any], trend: Dict[str, Any], message: str) -> str:
-    # For good news with low risk, skip interventions completely
+    # Skip for clearly positive events with low risk
     if insights.get("positive_event") and insights.get("risk_level") == "low":
         return ""
 
@@ -202,8 +241,8 @@ def run_intervention_agent(insights: Dict[str, Any], trend: Dict[str, Any], mess
 You are the Intervention Agent.
 
 If the student's message shows stress, sadness, worry, or feeling down:
-- Suggest 1-2 very small, practical exercises (for example a 1-minute breathing
-  exercise, a short grounding practice, or a tiny journaling task).
+- Suggest 1-2 very small, practical exercises (for example a 1-minute
+  breathing exercise, a short grounding practice, or a tiny journaling task).
 - Keep it at most 2 sentences.
 
 If the message is neutral or only informational, or you are not sure,
@@ -219,6 +258,7 @@ Message: {message}
         temperature=0.4,
     )
     return completion.choices[0].message.content.strip()
+
 
 # ============================================================
 # AGENT 5 - Safety Agent
@@ -255,6 +295,7 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
 
     return base
 
+
 # ============================================================
 # AGENT 6 - Style Agent
 # ============================================================
@@ -283,31 +324,38 @@ Insights: {insights}
     )
     return completion.choices[0].message.content
 
+
 # ============================================================
 # Base system prompt (strict language + rules)
 # ============================================================
 BASE_SYSTEM_PROMPT = """
-You are a wellbeing companion for University of Adelaide students.
+You are a wellbeing companion for university students.
 
 Language rules:
-- If the student writes mainly in Vietnamese, always answer 100% in Vietnamese.
-- If the student writes mainly in English, answer 100% in English.
-- Do not reply in Chinese/Japanese/Korean unless the entire user message is in that language.
-- If the user mixes 1-2 foreign characters inside Vietnamese, treat them as normal text
-  and do not explain them unless they ask explicitly.
+- Always answer 100% in the same main language as the student.
+- Do not mix languages unless the student clearly does so and asks for it.
+- Do not translate unless the student explicitly asks for a translation.
+
+For Vietnamese (vi):
+- Use natural Vietnamese.
+- You may use casual Southern style expressions if appropriate.
+
+For English (en):
+- Use natural conversational English.
+- If the student is in Australia, you may sound like an Aussie uni friend.
+
+For Chinese (zh), Korean (ko), Japanese (ja):
+- Use casual, friendly style in that language.
+- Keep sentences simple and supportive.
 
 Good news rules:
 - If the student's message is a clearly positive event and risk level is low,
-  you must respond like a close Vietnamese friend.
-- Tone: vui, thân mật, tự nhiên, giống bạn thân người Việt ở Adelaide.
-- Do NOT use CBT, journaling, self-reflection, breathing exercises or any
-  wellbeing techniques in that case.
-- Do NOT mention wellbeing support services in that case.
-- Keep the reply ngắn gọn, vui, ấm áp, có thể hỏi thêm 1 câu nhỏ kiểu
-  "Giờ tính ăn mừng sao nè?".
+  you must respond like a close friend (not a counsellor).
+- No CBT, journaling, breathing exercises, or wellbeing techniques in that case.
+- Do NOT mention wellbeing / counselling services in that case.
 
 Support rules:
-- Only provide University of Adelaide wellbeing/counselling support information when:
+- Only provide university wellbeing/counselling support information when:
   (1) risk_level or override_risk_level is "medium" or "high", OR
   (2) the user clearly expresses sadness, stress, anxiety, loneliness, or overwhelm.
 - Do NOT provide support info for neutral, playful, or purely positive messages.
@@ -317,6 +365,145 @@ Never:
 - Promise confidentiality.
 - Act as an emergency service.
 """
+
+
+# ============================================================
+# Build language-specific Joy Mode and slang hints
+# ============================================================
+def build_language_block(language: str) -> str:
+    if language == "vi":
+        return """
+Detected language: Vietnamese (vi).
+
+When replying in Vietnamese:
+- Use simple, natural Vietnamese, can be Southern-style if the message suggests it.
+- Understand slang such as:
+  "ăn bể bụng" (eat a lot, very full),
+  "bún có bèo" (too cheap / too basic for celebration),
+  "bèo quá hong?" (is it too cheap?),
+  "xỉu up xỉu down" (very shocked or excited),
+  "lụm liền" (grab the opportunity immediately).
+- Respond naturally as a close Vietnamese friend.
+"""
+    if language == "en":
+        return """
+Detected language: English (en).
+
+When replying in English:
+- Sound like a close uni friend.
+- You may understand and use light Aussie slang such as:
+  "mate", "stoked", "bloody legend", "no worries", "that's sick".
+- Keep it warm, supportive, and conversational.
+"""
+    if language == "zh":
+        return """
+Detected language: Chinese (zh).
+
+When replying in Chinese:
+- Use friendly, casual Mandarin.
+- Understand basic internet slang like "哈哈哈", "可以哦", "稳了", "好扯", "太牛了".
+- Sound like a close friend, not a therapist.
+"""
+    if language == "ko":
+        return """
+Detected language: Korean (ko).
+
+When replying in Korean:
+- Use casual but respectful style suitable for uni students.
+- Understand common slang like "대박", "헐", "ㅋㅋㅋ", "미쳤다" (as excitement).
+"""
+    if language == "ja":
+        return """
+Detected language: Japanese (ja).
+
+When replying in Japanese:
+- Use friendly, casual style (but not rude).
+- Understand simple slang like "やばい", "マジで", "すごい", used in a positive sense.
+"""
+    return """
+Detected language: other or unknown.
+
+Follow the language used by the student and keep a friendly, simple tone.
+"""
+
+
+def build_joy_block(language: str, joy_mode: bool) -> str:
+    if not joy_mode:
+        return ""
+
+    if language == "vi":
+        return """
+The user is sharing clearly positive news with low risk (Vietnamese).
+
+Joy mode instructions:
+- Respond exactly like a close Vietnamese friend (Southern casual style is OK).
+- Tone: very warm, excited, funny and friendly.
+- Use expressions like: "Trời ơi, chúc mừng nha!", "Ghê vậy trời!", "Quá dữ luôn á!", "Vui giùm luôn đó!".
+- You MAY ask ONE playful follow-up question such as "Giờ tính ăn mừng sao nè?".
+- Absolutely DO NOT:
+  - suggest CBT, journaling, breathing, reflection
+  - mention wellbeing or counselling services
+  - sound like a counsellor or teacher.
+"""
+
+    if language == "en":
+        return """
+The user is sharing clearly positive news with low risk (English).
+
+Joy mode instructions:
+- Respond like a close uni friend (Aussie style is OK).
+- Tone: warm, excited, relaxed.
+- You can use light slang such as "Congrats mate, that's awesome!", "I'm so stoked for you!", "You're a legend!".
+- You MAY ask ONE playful follow-up question such as "So how are you going to celebrate?".
+- Do NOT bring up CBT or wellbeing techniques.
+- Do NOT mention support services in this message.
+"""
+
+    if language == "zh":
+        return """
+The user is sharing clearly positive news with low risk (Chinese).
+
+Joy mode instructions:
+- Respond like a close Chinese-speaking friend.
+- Tone: warm, excited, casual.
+- You can use expressions like "哇，太厉害了！", "恭喜恭喜！", "真的很为你开心！".
+- You MAY ask one light follow-up question about how they will celebrate.
+- Do NOT mention wellbeing techniques or support services in this message.
+"""
+
+    if language == "ko":
+        return """
+The user is sharing clearly positive news with low risk (Korean).
+
+Joy mode instructions:
+- Respond like a close Korean friend.
+- Tone: warm, excited, casual.
+- You can use expressions like "와, 대박이다!", "진짜 축하해!", "너무 잘했다!".
+- You MAY ask one light follow-up question about celebration.
+- Do NOT mention wellbeing techniques or support services in this message.
+"""
+
+    if language == "ja":
+        return """
+The user is sharing clearly positive news with low risk (Japanese).
+
+Joy mode instructions:
+- Respond like a close Japanese friend.
+- Tone: warm, excited, casual.
+- You can use expressions like "うわ、すごいね！", "おめでとう！", "自分のことみたいに嬉しい！".
+- You MAY ask one light follow-up question.
+- Do NOT mention wellbeing techniques or support services in this message.
+"""
+
+    return """
+The user is sharing clearly positive news with low risk (unknown language).
+
+Joy mode instructions:
+- Reply like a close friend in the same language as the student.
+- Keep it short, warm, and excited.
+- No CBT, no wellbeing techniques, no support services in this message.
+"""
+
 
 # ============================================================
 # AGENT 7 - Response Agent (final answer)
@@ -331,25 +518,11 @@ def run_response_agent(
     style_hint: str,
 ) -> str:
 
-    joy_mode = insights.get("positive_event") and insights.get("risk_level") == "low"
+    language = insights.get("language") or detect_language_fallback(req.message)
+    joy_mode = bool(insights.get("positive_event") and insights.get("risk_level") == "low")
 
-    joy_block = ""
-    if joy_mode:
-        joy_block = """
-The user is sharing clearly positive news with low risk.
-For this message, you MUST talk like a close Vietnamese friend celebrating with them.
-
-Tone requirements:
-- Very warm, excited, natural, friendly, Vietnamese style.
-- Use simple, everyday Vietnamese expressions like "Trời ơi, chúc mừng nha!",
-  "Ghê vậy trời!", "Quá dữ luôn á!", "Vui giùm luôn đó!".
-- Keep it short, fun, light.
-- You may ask ONE playful follow-up question (for example "Giờ tính ăn mừng sao nè?").
-- Absolutely do NOT:
-  - suggest CBT, journaling, breathing, or reflection exercises
-  - mention University support services
-  - sound like a counsellor or teacher.
-"""
+    language_block = build_language_block(language)
+    joy_block = build_joy_block(language, joy_mode)
 
     effective_risk = safety.get("override_risk_level") or insights.get("risk_level")
 
@@ -371,6 +544,10 @@ Tone requirements:
 
     system_content = (
         BASE_SYSTEM_PROMPT
+        + "\n\nCurrent language code: " + str(language)
+        + "\n\n"
+        + language_block
+        + "\n"
         + joy_block
         + "\nSTYLE HINT (internal):\n"
         + style_hint
@@ -398,10 +575,11 @@ Tone requirements:
     )
     return completion.choices[0].message.content
 
+
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="Wellbeing Agent - 7 Agents with Joy Mode and JSON Fix")
+app = FastAPI(title="Wellbeing Agent - 7 Agents, Multilingual Joy Mode with Slang")
 
 app.add_middleware(
     CORSMiddleware,
@@ -410,6 +588,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -435,6 +614,7 @@ def chat(req: ChatRequest):
     )
 
     return ChatResponse(reply=reply)
+
 
 @app.get("/health")
 def health():
