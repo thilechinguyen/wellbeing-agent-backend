@@ -1017,51 +1017,18 @@ def run_response_agent(
     joy_block = build_joy_block(language, joy_mode)
 
     # ----------------------------------------------------
-    # Check last assistant reply to avoid "parrot" support spam
+    # Decide whether to add support block (HIGH RISK ONLY)
     # ----------------------------------------------------
-    last_assistant_text = ""
-    for m in reversed(req.history):
-        if m.role == "assistant":
-            last_assistant_text = m.content or ""
-            break
-
-    already_has_support = "University of Adelaide – Student Wellbeing Support" in last_assistant_text
-
-    # Decide whether to add support block
-    emotional_keywords = [
-        "stress",
-        "lo lắng",
-        "lo lang",
-        "buồn",
-        "buon",
-        "khóc",
-        "khoc",
-        "sad",
-        "anxious",
-        "căng thẳng",
-        "cang thang",
-        "cô đơn",
-        "co don",
-        "bỏ nhà đi",
-        "bo nha di",
-    ]
-
+    # For normal buồn / bị kỳ thị / bị bạn cười → chỉ an ủi, không dán support.
     add_support = False
-    if effective_risk in ["medium", "high"]:
-        add_support = True
-    if any(kw in msg_low for kw in emotional_keywords):
-        add_support = True
-    if safety.get("escalate"):
+
+    if effective_risk == "high" or safety.get("escalate"):
         add_support = True
 
     # In joy mode, never add support block and never use interventions
     if joy_mode:
         add_support = False
         interventions = ""
-
-    # Nếu đã gửi support block ở message trước rồi thì không gửi lại nữa
-    if already_has_support:
-        add_support = False
 
     # Build support_instruction (smooth intro + block)
     support_instruction = ""
@@ -1162,7 +1129,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - V8 Safety+Emotion+Joy Sticky+Identity Lock+Adelaide Support+UniGate+NoParrot"
+    title="Wellbeing Agent - V9 Safety+Emotion+JoySticky+IdentityLock+AdelaideHighRisk+UniGate"
 )
 
 app.add_middleware(
