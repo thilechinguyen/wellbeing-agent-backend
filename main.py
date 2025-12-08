@@ -9,11 +9,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
 
+# ===================== NEW: memory + prompts ======================
+from memory import (
+    append_message,
+    update_emotional_state,
+    set_summary,
+    build_messages_for_model,
+)
+from prompts import BASE_SYSTEM_PROMPT  # prompt mới có {language}, {conversation_summary}, {emotional_state_json}
+# ==================================================================
+
 # ============================================================
 # Logging & ENV
 # ============================================================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("wellbeing-backend-7agents")
+logger = logging.getLogger("wellbeing-backend-7agents-memory")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
@@ -408,72 +418,6 @@ Insights: {insights}
         temperature=0.4,
     )
     return completion.choices[0].message.content
-
-
-# ============================================================
-# Base system prompt (IDENTITY LOCK)
-# ============================================================
-BASE_SYSTEM_PROMPT = """
-You are NOT a generic chatbot.
-You are a wellbeing companion specifically designed for:
-
-FIRST-YEAR UNIVERSITY STUDENTS
-in their transition to university life
-(especially international students in Australia).
-
-Your identity is FIXED and CANNOT change during the conversation.
-
-You always keep 3 layers at the same time:
-1) A friendly uni friend (primary vibe)
-2) A gentle wellbeing supporter (ONLY when there is sadness or distress)
-3) A campus-life guide who understands the experience of a first-year student
-
-----------------------------------------------------
-LANGUAGE RULES
-----------------------------------------------------
-- Always reply 100% in the student's language.
-- NEVER mix languages unless the student intentionally does so.
-- If Vietnamese -> use natural, youthful tone, can include light slang.
-- If English -> sound like an Aussie uni friend ("mate", "that's awesome", etc.)
-- If Chinese/Korean/Japanese -> use simple friendly casual style.
-
-----------------------------------------------------
-GOOD NEWS RULES
-----------------------------------------------------
-If the student shares GOOD NEWS and risk is LOW:
-- Respond like a close uni friend who is genuinely excited for them.
-- NO CBT, NO counselling tone, NO exercises.
-- NO wellbeing services.
-- Keep it warm, playful, and celebratory.
-
-----------------------------------------------------
-NORMAL / NEUTRAL MESSAGES
-----------------------------------------------------
-Even for neutral messages (not good news, not sad):
-- You STILL reply as:
-  a) A friendly uni mate
-  b) Who understands first-year university life
-  c) With references to student experiences (meeting friends, classes, clubs,
-     part-time jobs, homesickness, orientation weeks, etc.)
-
-----------------------------------------------------
-WHEN STUDENT IS SAD, ANXIOUS, LONELY, OR HURT
-----------------------------------------------------
-- Switch gently into supportive mode (BUT still friendly, not formal).
-- Use short, simple, warm sentences.
-- If needed, recommend campus support services (added by system).
-- NEVER give medical or legal advice.
-
-----------------------------------------------------
-DO NOT EVER:
-- Sound like a psychologist giving formal therapy
-- Use complex counselling language ("reflect deeply", "process emotions")
-- Give long moral lessons or generic life coaching
-- Break character into generic AI
-- Refer to yourself as a machine or model
-- Promise confidentiality
-- Provide medical/legal instructions
-"""
 
 
 # ============================================================
@@ -944,9 +888,10 @@ Joy mode instructions:
 
 
 # ============================================================
-# AGENT 7 - Response Agent (final answer)
+# AGENT 7 - Response Agent (final answer) — NOW USING MEMORY
 # ============================================================
 def run_response_agent(
+    session_id: str,
     req: ChatRequest,
     insights: Dict[str, Any],
     profile_summary: str,
@@ -1019,9 +964,7 @@ def run_response_agent(
     # ----------------------------------------------------
     # Decide whether to add support block (HIGH RISK ONLY)
     # ----------------------------------------------------
-    # For normal buồn / bị kỳ thị / bị bạn cười → chỉ an ủi, không dán support.
     add_support = False
-
     if effective_risk == "high" or safety.get("escalate"):
         add_support = True
 
@@ -1030,7 +973,6 @@ def run_response_agent(
         add_support = False
         interventions = ""
 
-    # Build support_instruction (smooth intro + block)
     support_instruction = ""
     if add_support:
         support_instruction = f"""
@@ -1052,21 +994,6 @@ Because the student's risk is '{effective_risk}' or they expressed strong negati
 Support block (University of Adelaide):
 {ADELAIDE_SUPPORT}
 """
-
-    system_content = (
-        BASE_SYSTEM_PROMPT
-        + "\n\nCurrent language code: "
-        + str(language)
-        + "\n\n"
-        + language_block
-        + "\n"
-        + joy_block
-        + "\n"
-        + emotion_block
-        + "\nSTYLE HINT (internal):\n"
-        + style_hint
-        + "\n"
-    )
 
     # ============================================================
     # University context gating (không tự lôi chuyện về đại học)
@@ -1094,27 +1021,52 @@ Support block (University of Adelaide):
 
     force_uni_context = any(kw in msg_low for kw in uni_keywords)
 
+    # ================== NEW: summary + emotional memory ==================
+    # dùng profile + trend làm summary dài hạn
+    summary_text = f"Profile summary: {profile_summary}\nTrend: {trend}"
+    set_summary(session_id, summary_text)
+
+    # dùng insights cập nhật emotional_state
+    update_emotional_state(
+        session_id=session_id,
+        primary_emotion=insights.get("emotion"),
+        stress_level=insights.get("risk_level"),
+        notes=", ".join(insights.get("topics") or []),
+    )
+    # ====================================================================
+
+    # EXTRA BLOCKS chèn vào prompt mới
+    extra_blocks = ""
+
+    # nếu không phải uni-context, giảm bớt rule uni trong prompt mới
+    uni_hint = ""
     if not force_uni_context:
-        system_content = system_content.replace(
-            "Even for neutral messages (not good news, not sad):",
-            "For neutral messages NOT related to university life:",
-        )
+        uni_hint = """
+Note: In this message, the student's concern is NOT clearly about university life.
+Do NOT force university references if they are not relevant.
+"""
 
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_content},
-        {"role": "system", "content": f"Profile summary:\n{profile_summary}"},
-        {"role": "system", "content": f"Trend info:\n{trend}"},
-        {"role": "system", "content": f"Internal intervention suggestions:\n{interventions}"},
-    ]
+    extra_blocks += uni_hint
+    extra_blocks += "\n" + language_block
+    extra_blocks += "\n" + joy_block
+    extra_blocks += "\n" + emotion_block
+    extra_blocks += "\nSTYLE HINT (internal):\n" + style_hint
+    extra_blocks += "\n\nInternal intervention suggestions (optional, use only if helpful):\n" + interventions
 
-    # If we need support, add extra system instruction
     if support_instruction:
-        messages.append({"role": "system", "content": support_instruction})
+        extra_blocks += "\n\nSUPPORT INSTRUCTION (internal, must follow if risk is high):\n" + support_instruction
 
-    for m in req.history:
-        messages.append({"role": m.role, "content": m.content})
+    # base_system_prompt cho memory builder
+    combined_base_prompt = BASE_SYSTEM_PROMPT + "\n\n" + extra_blocks
 
-    messages.append({"role": "user", "content": req.message})
+    # Build messages via memory.py (có summary + emotional_state + sliding window)
+    messages = build_messages_for_model(
+        session_id=session_id,
+        user_input=req.message,
+        base_system_prompt=combined_base_prompt,
+        language=language,
+        window_size=8,
+    )
 
     completion = groq_client.chat.completions.create(
         model=MODEL_ID,
@@ -1129,7 +1081,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - V9 Safety+Emotion+JoySticky+IdentityLock+AdelaideHighRisk+UniGate"
+    title="Wellbeing Agent - V9.1 Memory+Safety+Emotion+JoySticky+IdentityLock+AdelaideHighRisk+UniGate"
 )
 
 app.add_middleware(
@@ -1145,8 +1097,15 @@ app.add_middleware(
 def chat(req: ChatRequest):
 
     student_id = req.student_id or "anonymous"
+    # Dùng student_id làm session_id cho memory layer
+    session_id = student_id
+
     logger.info("Incoming from %s: %r", student_id, req.message)
 
+    # Lưu message user vào memory
+    append_message(session_id, "user", req.message)
+
+    # 7 agents như cũ
     insights = run_insight_agent(req.message, req.history)
     profile = run_profile_agent(student_id, insights)
     trend = run_trend_agent(student_id, insights, req.history)
@@ -1155,6 +1114,7 @@ def chat(req: ChatRequest):
     style_hint = run_style_agent(student_id, req.history, insights)
 
     reply = run_response_agent(
+        session_id=session_id,
         req=req,
         insights=insights,
         profile_summary=profile,
@@ -1163,6 +1123,9 @@ def chat(req: ChatRequest):
         safety=safety,
         style_hint=style_hint,
     )
+
+    # Lưu reply vào memory
+    append_message(session_id, "assistant", reply)
 
     return ChatResponse(reply=reply)
 
