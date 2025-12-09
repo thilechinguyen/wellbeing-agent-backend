@@ -1,16 +1,13 @@
 # memory.py
 """
-Simple in-memory conversation + emotional memory layer
+Simple in-memory conversation + emotional + preference memory layer
 for the wellbeing agent.
 
-- Lưu toàn bộ hội thoại theo session_id
+- Lưu toàn bộ hội thoại theo session_id (student_id)
 - Cung cấp cửa sổ ngắn (sliding window) cho LLM
 - Lưu summary (tóm tắt) dài hạn
 - Lưu trạng thái cảm xúc (emotional_state)
-- Xây dựng messages[] đã gắn memory để gửi sang LLM
-
-Nếu sau này bạn muốn dùng Postgres, chỉ cần thay thế
-_phần global dict_ bằng ORM/DB call là được.
+- Lưu user preferences (vd: cách xưng hô tiếng Việt)
 """
 
 from __future__ import annotations
@@ -44,11 +41,18 @@ class EmotionalSnapshot:
 
 
 @dataclass
+class UserPreferences:
+    # pronouns_vi: e.g. "mình-bạn", "tớ-cậu", "em-anh", ...
+    pronouns_vi: Optional[str] = None
+
+
+@dataclass
 class ConversationState:
     session_id: str
     history: List[Message] = field(default_factory=list)
     summary: str = ""                           # running long-term summary
     emotional_state: EmotionalSnapshot = field(default_factory=EmotionalSnapshot)
+    preferences: UserPreferences = field(default_factory=UserPreferences)
 
 
 # ============================================================
@@ -104,6 +108,23 @@ def update_emotional_state(
         es.notes = notes
 
 
+def set_pronoun_preference(session_id: str, pronouns_vi: str) -> None:
+    """
+    Lưu cách xưng hô tiếng Việt ưa thích, ví dụ:
+    - "mình-bạn"
+    - "tớ-cậu"
+    - "em-anh"
+    """
+    state = get_state(session_id)
+    state.preferences.pronouns_vi = pronouns_vi.strip()
+
+
+def get_pronoun_preference(session_id: str) -> Optional[str]:
+    """Lấy cách xưng hô tiếng Việt đã lưu (nếu có)."""
+    state = get_state(session_id)
+    return state.preferences.pronouns_vi
+
+
 def get_short_history(session_id: str, window_size: int = 8) -> List[Message]:
     """Return the last N messages as sliding window for local context."""
     state = get_state(session_id)
@@ -132,7 +153,7 @@ def get_summary_or_default(session_id: str) -> str:
 
 
 # ============================================================
-# 3. Message builder for LLM
+# 3. (Optional) Message builder for LLM – vẫn giữ để dùng sau
 # ============================================================
 
 def build_messages_for_model(
@@ -144,21 +165,23 @@ def build_messages_for_model(
 ) -> List[Dict[str, str]]:
     """
     Build the messages[] payload for the LLM, including:
-    - system prompt (đã gắn summary + emotional_state)
+    - system prompt (đã gắn summary + emotional_state + pronoun preference)
     - short sliding window history
     - current user message
 
     base_system_prompt: chuỗi prompt có chứa {language},
-    {conversation_summary}, {emotional_state_json}.
+    {conversation_summary}, {emotional_state_json}, {pronoun_preference}.
     """
 
     conversation_summary = get_summary_or_default(session_id)
     emotional_state_json = get_emotional_state_json(session_id)
+    pronoun_preference = get_pronoun_preference(session_id) or "none"
 
     system_content = base_system_prompt.format(
         language=language,
         conversation_summary=conversation_summary,
         emotional_state_json=emotional_state_json,
+        pronoun_preference=pronoun_preference,
     )
 
     messages: List[Dict[str, str]] = [

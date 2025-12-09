@@ -1,13 +1,27 @@
+# main.py
 import os
 import re
 import json
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
+
+from memory import (
+    append_message,
+    set_summary,
+    update_emotional_state,
+    get_summary_or_default,
+    get_emotional_state_json,
+    get_pronoun_preference,
+    set_pronoun_preference,
+)
+from prompts import BASE_SYSTEM_PROMPT as MEMORY_PROMPT
+from cultural_profiles import build_profile_block
+from conversation_logging import init_db, log_turn, attach_export_routes
 
 # ============================================================
 # Logging & ENV
@@ -20,22 +34,7 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not set")
 
 MODEL_ID = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
-
 groq_client = Groq(api_key=GROQ_API_KEY)
-
-# ============================================================
-# Import cultural profile, logging, memory, prompts
-# ============================================================
-from cultural_profiles import build_profile_block
-from conversation_logging import init_db, log_turn, attach_export_routes
-from memory import (
-    append_message,
-    set_summary,
-    update_emotional_state,
-    get_summary_or_default,
-    get_emotional_state_json,
-)
-from prompts import BASE_SYSTEM_PROMPT  # prompt template có {language}, {conversation_summary}, {emotional_state_json}
 
 
 # ============================================================
@@ -100,34 +99,6 @@ def detect_language_fallback(message: str) -> str:
 
 
 # ============================================================
-# Parse meta prefix [lang=...;profile_type=...;profile_region=...]
-# ============================================================
-def parse_meta_from_message(message: str) -> (Dict[str, str], str):
-    """
-    Parse prefix dạng:
-    [lang=vi;profile_type=domestic;profile_region=au] nội dung thật
-
-    Trả về:
-    - meta: dict
-    - cleaned: nội dung sau khi bỏ prefix
-    """
-    text = message.strip()
-    if not text.startswith("[") or "]" not in text[:120]:
-        return {}, message
-
-    header, rest = text.split("]", 1)
-    header = header.strip("[]").strip()
-    meta: Dict[str, str] = {}
-    for part in header.split(";"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            meta[k.strip()] = v.strip()
-
-    cleaned = rest.lstrip()
-    return meta, cleaned
-
-
-# ============================================================
 # Adelaide support block
 # ============================================================
 ADELAIDE_SUPPORT = """
@@ -167,6 +138,63 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+# ============================================================
+# Meta prefix parser: [lang=...;profile_type=...;profile_region=...] msg
+# ============================================================
+def parse_meta_from_message(raw: str) -> Tuple[Dict[str, str], str]:
+    """
+    Parse prefix dạng:
+      [lang=vi;profile_type=domestic;profile_region=au] em bị mẹ mắng
+    Trả về (meta_dict, cleaned_message)
+    """
+    raw = (raw or "").strip()
+    if not raw.startswith("["):
+        return {}, raw
+
+    closing = raw.find("]")
+    if closing == -1 or closing > 200:
+        return {}, raw
+
+    meta_str = raw[1:closing]
+    rest = raw[closing + 1 :].lstrip()
+
+    meta: Dict[str, str] = {}
+    for part in meta_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            meta[k.strip()] = v.strip()
+    return meta, rest
+
+
+# ============================================================
+# Pronoun detection helper (Vietnamese)
+# ============================================================
+def detect_pronoun_preference_vi(text: str) -> Optional[str]:
+    """
+    Heuristic: nếu message ngắn và chứa cặp đại từ quen thuộc,
+    coi như là câu trả lời chọn cách xưng hô.
+    """
+    t = text.lower().strip()
+    if not t:
+        return None
+
+    # Giới hạn độ dài (để tránh nhầm trong câu dài)
+    if len(t) > 120:
+        return None
+
+    # Các cặp phổ biến
+    if "mình" in t and "bạn" in t:
+        return "mình-bạn"
+    if "tớ" in t and "cậu" in t:
+        return "tớ-cậu"
+    if "em" in t and "anh" in t:
+        return "em-anh"
+    if "em" in t and "chị" in t:
+        return "em-chị"
+    return None
 
 
 # ============================================================
@@ -257,11 +285,7 @@ Insights: {insights}
 # ============================================================
 # AGENT 3 - Trend Agent
 # ============================================================
-def run_trend_agent(
-    student_id: str,
-    insights: Dict[str, Any],
-    history: List[ChatMessage],
-) -> Dict[str, Any]:
+def run_trend_agent(student_id: str, insights: Dict[str, Any], history: List[ChatMessage]) -> Dict[str, Any]:
     history_text = "\n".join([f"{m.role}: {m.content}" for m in history[-6:]])
 
     prompt = f"""
@@ -300,11 +324,7 @@ Recent history:
 # ============================================================
 # AGENT 4 - Intervention Agent (CBT OFF for positive / neutral)
 # ============================================================
-def run_intervention_agent(
-    insights: Dict[str, Any],
-    trend: Dict[str, Any],
-    message: str,
-) -> str:
+def run_intervention_agent(insights: Dict[str, Any], trend: Dict[str, Any], message: str) -> str:
     """
     Only suggest tiny interventions when the student is clearly
     sad / stressed / anxious / overwhelmed.
@@ -432,30 +452,17 @@ def run_safety_agent(message: str, insights: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# AGENT 6 - Style Agent (nhận thêm profile)
+# AGENT 6 - Style Agent
 # ============================================================
-def run_style_agent(
-    student_id: str,
-    history: List[ChatMessage],
-    insights: Dict[str, Any],
-    profile_type: Optional[str],
-    profile_region: Optional[str],
-) -> str:
+def run_style_agent(student_id: str, history: List[ChatMessage], insights: Dict[str, Any]) -> str:
     recent_user_msgs = "\n".join([m.content for m in history if m.role == "user"][-5:])
 
     prompt = f"""
 You are the Style Agent.
 
-Student identity:
-- type: {profile_type or "unknown"}   (domestic / international / other)
-- region: {profile_region or "unknown"}  (au / sea / eu / other)
-
-Based on the recent messages, insights, and identity, produce 2-3 bullet points
-describing how the assistant should adapt its tone for THIS student specifically.
-Consider for example:
-- International + SEA: might value family, may fear disappointing parents, may feel homesick.
-- Domestic + AU: might be used to casual Aussie style, part-time work + rent stress, independent living.
-- Other: keep it neutral, curious, respectful.
+Based on the recent messages and insights, produce 2-3 bullet points
+describing how the assistant should adapt its tone for this student
+(for example: shorter answers, more casual, more examples, more direct).
 
 This note is INTERNAL ONLY, never shown to the student.
 
@@ -471,6 +478,97 @@ Insights: {insights}
         temperature=0.4,
     )
     return completion.choices[0].message.content
+
+
+# ============================================================
+# Identity / role lock for this agent
+# ============================================================
+IDENTITY_PROMPT = """
+You are NOT a generic chatbot.
+You are a wellbeing companion specifically designed for:
+
+FIRST-YEAR UNIVERSITY STUDENTS
+in their transition to university life
+(especially international students in Australia).
+
+Your identity is FIXED and CANNOT change during the conversation.
+
+You always keep 3 layers at the same time:
+1) A friendly uni friend (primary vibe)
+2) A gentle wellbeing supporter (ONLY when there is sadness or distress)
+3) A campus-life guide who understands the experience of a first-year student
+
+Do NOT ever:
+- Sound like a psychologist giving formal therapy
+- Use complex counselling language ("reflect deeply", "process emotions")
+- Give long moral lessons or generic life coaching
+- Break character into generic AI
+- Refer to yourself as a machine or model
+- Promise confidentiality
+- Provide medical or legal instructions
+"""
+
+
+# ============================================================
+# Joy-context detection (Joy Sticky)
+# ============================================================
+def is_celebration_context(all_msgs: List[ChatMessage]) -> bool:
+    """
+    Check if the recent conversation is mainly about a positive event
+    like scholarship, lottery, getting a job, passing an exam, etc.
+    """
+    user_texts = [m.content.lower() for m in all_msgs if m.role == "user"]
+    if not user_texts:
+        return False
+
+    # Look at last few user messages only
+    text = " ".join(user_texts[-6:])
+
+    celebration_keywords = [
+        "trúng số",
+        "trung so",
+        "trúng học bổng",
+        "trung hoc bong",
+        "được học bổng",
+        "duoc hoc bong",
+        "học bổng",
+        "hoc bong",
+        "đậu visa",
+        "dau visa",
+        "được nhận",
+        "duoc nhan",
+        "passed the exam",
+        "pass the exam",
+        "got a scholarship",
+        "won the lottery",
+        "got the job",
+        "got an offer",
+        "accepted into",
+    ]
+    negative_keywords = [
+        "buồn",
+        "buon",
+        "stress",
+        "lo lắng",
+        "lo lang",
+        "không muốn sống",
+        "khong muon song",
+        "sad",
+        "anxious",
+        "depressed",
+        "bị đánh",
+        "bi danh",
+        "đánh em",
+        "danh em",
+        "bạo lực",
+        "bao luc",
+    ]
+
+    if any(kw in text for kw in celebration_keywords) and not any(
+        kw in text for kw in negative_keywords
+    ):
+        return True
+    return False
 
 
 # ============================================================
@@ -547,9 +645,7 @@ def build_emotion_block(
     - deep sadness / heartbreak
     """
     emotion = str(insights.get("emotion") or "").lower()
-    risk_level = (
-        safety.get("override_risk_level") or insights.get("risk_level") or "low"
-    ).lower()
+    risk_level = (safety.get("override_risk_level") or insights.get("risk_level") or "low").lower()
     escalate = bool(safety.get("escalate"))
     is_violence = bool(safety.get("violence"))
     is_self_harm = bool(safety.get("self_harm"))
@@ -739,68 +835,6 @@ For this reply:
 
 
 # ============================================================
-# Joy-context detection (Joy Sticky)
-# ============================================================
-def is_celebration_context(all_msgs: List[ChatMessage]) -> bool:
-    """
-    Check if the recent conversation is mainly about a positive event
-    like scholarship, lottery, getting a job, passing an exam, etc.
-    """
-    user_texts = [m.content.lower() for m in all_msgs if m.role == "user"]
-    if not user_texts:
-        return False
-
-    # Look at last few user messages only
-    text = " ".join(user_texts[-6:])
-
-    celebration_keywords = [
-        "trúng số",
-        "trung so",
-        "trúng học bổng",
-        "trung hoc bong",
-        "được học bổng",
-        "duoc hoc bong",
-        "học bổng",
-        "hoc bong",
-        "đậu visa",
-        "dau visa",
-        "được nhận",
-        "duoc nhan",
-        "passed the exam",
-        "pass the exam",
-        "got a scholarship",
-        "won the lottery",
-        "got the job",
-        "got an offer",
-        "accepted into",
-    ]
-    negative_keywords = [
-        "buồn",
-        "buon",
-        "stress",
-        "lo lắng",
-        "lo lang",
-        "không muốn sống",
-        "khong muon song",
-        "sad",
-        "anxious",
-        "depressed",
-        "bị đánh",
-        "bi danh",
-        "đánh em",
-        "danh em",
-        "bạo lực",
-        "bao luc",
-    ]
-
-    if any(kw in text for kw in celebration_keywords) and not any(
-        kw in text for kw in negative_keywords
-    ):
-        return True
-    return False
-
-
-# ============================================================
 # Joy block
 # ============================================================
 def build_joy_block(language: str, joy_mode: bool) -> str:
@@ -943,9 +977,11 @@ Joy mode instructions:
 
 
 # ============================================================
-# AGENT 7 - Response Agent (final answer, dùng memory + prompts)
+# AGENT 7 - Response Agent (final answer)
 # ============================================================
 def run_response_agent(
+    *,
+    student_id: str,
     req: ChatRequest,
     insights: Dict[str, Any],
     profile_summary: str,
@@ -953,16 +989,28 @@ def run_response_agent(
     interventions: str,
     safety: Dict[str, Any],
     style_hint: str,
-    student_profile: Dict[str, Any],
-    session_id: str,
+    student_profile: Dict[str, Optional[str]],
+    language_override: Optional[str],
+    pronoun_preference: Optional[str],
 ) -> str:
 
     # Language from insight or fallback
-    language = insights.get("language") or detect_language_fallback(req.message)
+    language = language_override or insights.get("language") or detect_language_fallback(
+        req.message
+    )
 
-    # Get memory summary + emotional_state_json cho prompt
-    conversation_summary = get_summary_or_default(session_id)
-    emotional_state_json = get_emotional_state_json(session_id)
+    # Memory-based fields
+    conversation_summary = get_summary_or_default(student_id)
+    emotional_state_json = get_emotional_state_json(student_id)
+    pronoun_pref = pronoun_preference or "none"
+
+    # Build memory/system core from prompts.py
+    system_content_core = MEMORY_PROMPT.format(
+        language=language,
+        conversation_summary=conversation_summary,
+        emotional_state_json=emotional_state_json,
+        pronoun_preference=pronoun_pref,
+    )
 
     # Build full message list for context-based joy detection
     all_msgs: List[ChatMessage] = list(req.history) + [
@@ -1021,6 +1069,7 @@ def run_response_agent(
     emotion_block = build_emotion_block(insights, safety, language)
     joy_block = build_joy_block(language, joy_mode)
 
+    # Profile / cultural block
     profile_type = student_profile.get("profile_type")
     profile_region = student_profile.get("profile_region")
     profile_block = build_profile_block(profile_type, profile_region)
@@ -1029,7 +1078,6 @@ def run_response_agent(
     # Decide whether to add support block (HIGH RISK ONLY)
     # ----------------------------------------------------
     add_support = False
-
     if effective_risk == "high" or safety.get("escalate"):
         add_support = True
 
@@ -1038,7 +1086,6 @@ def run_response_agent(
         add_support = False
         interventions = ""
 
-    # Build support_instruction (smooth intro + block)
     support_instruction = ""
     if add_support:
         support_instruction = f"""
@@ -1046,12 +1093,6 @@ Because the student's risk is '{effective_risk}' or they expressed strong negati
 
 1) First, in the SAME LANGUAGE as the student, add 1–2 SHORT sentences that smoothly introduce
    the idea of getting extra support from the university.
-   - For example in Vietnamese:
-     "Ngoài ra, nếu một lúc nào đó em cảm thấy cần thêm sự hỗ trợ chuyên nghiệp,
-     em hoàn toàn có thể liên hệ với các dịch vụ hỗ trợ của trường dưới đây."
-   - Or in English:
-     "If at any point you feel you’d like more professional support,
-     you can also reach out to the support services at uni below."
 
 2) Then, on the next lines, you MUST append the following support information block
    at the END of your reply, after your own supportive message.
@@ -1061,15 +1102,10 @@ Support block (University of Adelaide):
 {ADELAIDE_SUPPORT}
 """
 
-    # ===== System prompt từ prompts.py (có chèn memory) =====
-    system_content_core = BASE_SYSTEM_PROMPT.format(
-        language=language,
-        conversation_summary=conversation_summary,
-        emotional_state_json=emotional_state_json,
-    )
-
     system_content = (
-        system_content_core
+        IDENTITY_PROMPT
+        + "\n\n"
+        + system_content_core
         + "\n\nCurrent language code: "
         + str(language)
         + "\n\n"
@@ -1083,54 +1119,21 @@ Support block (University of Adelaide):
         + "\nSTYLE HINT (internal):\n"
         + style_hint
         + "\n"
+        + "Internal interventions (optional):\n"
+        + interventions
+        + "\n"
     )
-
-    # ============================================================
-    # University context gating (không tự lôi chuyện về đại học)
-    # ============================================================
-    uni_keywords = [
-        "uni",
-        "university",
-        "campus",
-        "class",
-        "assignment",
-        "study",
-        "lecture",
-        "orientation",
-        "exam",
-        "tutorial",
-        "học",
-        "bài tập",
-        "trường",
-        "đại học",
-        "lớp",
-        "thi",
-        "kỳ thi",
-        "ky thi",
-    ]
-
-    force_uni_context = any(kw in msg_low for kw in uni_keywords)
-
-    if not force_uni_context:
-        system_content = system_content.replace(
-            "Even for neutral messages (not good news, not sad):",
-            "For neutral messages NOT related to university life:",
-        )
 
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_content},
         {"role": "system", "content": f"Profile summary:\n{profile_summary}"},
         {"role": "system", "content": f"Trend info:\n{trend}"},
-        {
-            "role": "system",
-            "content": f"Internal intervention suggestions:\n{interventions}",
-        },
     ]
 
-    # If we need support, add extra system instruction
     if support_instruction:
         messages.append({"role": "system", "content": support_instruction})
 
+    # replay short history từ frontend
     for m in req.history:
         messages.append({"role": m.role, "content": m.content})
 
@@ -1149,7 +1152,7 @@ Support block (University of Adelaide):
 # FastAPI app
 # ============================================================
 app = FastAPI(
-    title="Wellbeing Agent - V9 + Memory + CulturalProfile + Logging"
+    title="Wellbeing Agent - V10 Memory+Pronoun+7Agents+Safety+Emotion+JoySticky+IdentityLock+Adelaide"
 )
 
 app.add_middleware(
@@ -1160,7 +1163,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Khởi tạo DB logging + route export CSV
+# khởi tạo DB + route export CSV
 init_db()
 attach_export_routes(app)
 
@@ -1168,123 +1171,93 @@ attach_export_routes(app)
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
 
+    # session_id dùng luôn student_id
     student_id = req.student_id or "anonymous"
     logger.info("Incoming from %s: %r", student_id, req.message)
 
-    # 0) Append user message vào memory (server-side)
+    # 1) bóc meta prefix
     meta, cleaned_message = parse_meta_from_message(req.message)
+    meta_profile_type = meta.get("profile_type")
+    meta_profile_region = meta.get("profile_region")
+    meta_lang = meta.get("lang")
+
+    # 2) log vào memory (thô)
     append_message(student_id, "user", cleaned_message)
 
-    meta_lang = meta.get("lang")
-    meta_profile_type = meta.get("profile_type")        # domestic / international
-    meta_profile_region = meta.get("profile_region")    # au / sea / eu / other
-
-    # 1) Chạy các agent
-    insights = run_insight_agent(req.message, req.history)
-    profile = run_profile_agent(student_id, insights)
-    trend = run_trend_agent(student_id, insights, req.history)
-    safety = run_safety_agent(req.message, insights)
-    interventions = run_intervention_agent(insights, trend, req.message)
-    style_hint = run_style_agent(
-        student_id,
-        req.history,
-        insights,
-        profile_type=meta_profile_type,
-        profile_region=meta_profile_region,
+    # 3) Insight Agent
+    insights = run_insight_agent(cleaned_message, req.history)
+    language = meta_lang or insights.get("language") or detect_language_fallback(
+        cleaned_message
     )
 
-    # 2) Cập nhật memory: emotional_state + summary dài hạn
-    try:
-        update_emotional_state(
-            session_id=student_id,
-            primary_emotion=insights.get("emotion"),
-            stress_level=insights.get("risk_level"),
-            risk_level=insights.get("risk_level"),
-            notes=", ".join(insights.get("topics") or []),
-        )
-        # dùng luôn profile summary như một dạng long-term summary
-        set_summary(student_id, profile)
-    except Exception as e:
-        logger.warning("Failed to update memory state: %s", e)
+    # 4) update emotional_state trong memory
+    update_emotional_state(
+        session_id=student_id,
+        primary_emotion=insights.get("emotion"),
+        stress_level=insights.get("risk_level"),
+        risk_level=insights.get("risk_level"),
+        notes="; ".join(insights.get("topics", [])),
+    )
 
-    # 3) Gọi Response Agent (có memory)
-    student_profile_dict = {
-        "profile_type": meta_profile_type,
-        "profile_region": meta_profile_region,
-    }
+    # 5) nếu tiếng Việt, thử detect pronoun preference
+    if language == "vi":
+        pronoun_detected = detect_pronoun_preference_vi(cleaned_message)
+        if pronoun_detected:
+            set_pronoun_preference(student_id, pronoun_detected)
 
+    pronoun_pref = get_pronoun_preference(student_id)
+
+    # 6) Profile + Trend + Safety + Intervention + Style
+    profile = run_profile_agent(student_id, insights)
+    # dùng profile làm summary tạm thời (sau này có thể thêm Summary Agent riêng)
+    set_summary(student_id, profile)
+
+    trend = run_trend_agent(student_id, insights, req.history)
+    safety = run_safety_agent(cleaned_message, insights)
+    interventions = run_intervention_agent(insights, trend, cleaned_message)
+    style_hint = run_style_agent(student_id, req.history, insights)
+
+    # 7) Response Agent
     reply = run_response_agent(
-        req=req,
+        student_id=student_id,
+        req=ChatRequest(
+            student_id=req.student_id,
+            message=cleaned_message,
+            history=req.history,
+        ),
         insights=insights,
         profile_summary=profile,
         trend=trend,
         interventions=interventions,
         safety=safety,
         style_hint=style_hint,
-        student_profile=student_profile_dict,
-        session_id=student_id,
+        student_profile={
+            "profile_type": meta_profile_type,
+            "profile_region": meta_profile_region,
+        },
+        language_override=language,
+        pronoun_preference=pronoun_pref,
     )
 
-    # 4) Append assistant reply vào memory
+    # 8) lưu assistant message vào memory
     append_message(student_id, "assistant", reply)
 
-    # 5) Logging vào SQLite (conversation_logging.py cũ)
+    # 9) logging vào SQLite để nghiên cứu
     try:
-        # session_id: tạm dùng student_id (hoặc FE gửi riêng sau này)
-        session_id = student_id
-        # turn_index = số lượt trong phiên = len(history)
-        turn_index = len(req.history)
-
-        # lang_code: meta_lang nếu có, fallback insights.language
-        lang_code = meta_lang or insights.get("language")
-
-        # emotion payload cho logger
-        emotion_payload = {
-            "primary_emotion": insights.get("emotion"),
-            "stress_level": insights.get("risk_level"),
-            "main_issue": ", ".join(insights.get("topics") or []),
-            "next_steps": trend.get("trend"),
-            "full_insights": insights,
-            "interventions_suggestion": interventions,
-        }
-
-        # safety payload cho logger (có is_risk để risk_flag hoạt động)
-        is_high_risk = (
-            safety.get("escalate") is True
-            or insights.get("risk_level") == "high"
-        )
-
-        safety_payload = {
-            "is_risk": is_high_risk,
-            "safety_agent": safety,
-        }
-
-        # supervisor payload: extra meta cho nghiên cứu
-        supervisor_payload = {
-            "profile_summary": profile,
-            "trend": trend,
-            "student_profile_type": meta_profile_type,
-            "student_profile_region": meta_profile_region,
-        }
-
-        # condition: encode điều kiện nghiên cứu (nếu muốn)
-        condition = f"{meta_profile_type or 'unk'}_{meta_profile_region or 'unk'}_V9"
-
         log_turn(
-            session_id=session_id,
-            turn_index=turn_index,
+            session_id=student_id,
+            turn_index=None,  # conversation_logging sẽ fallback 0 nếu None
             user_id=student_id,
-            condition=condition,
-            lang_code=lang_code,
+            condition=None,
+            lang_code=language,
             user_text=cleaned_message,
             agent_text=reply,
-            emotion=emotion_payload,
-            safety=safety_payload,
-            supervisor=supervisor_payload,
+            emotion=insights,
+            safety=safety,
+            supervisor=None,
         )
-
     except Exception as e:
-        logger.warning("Failed to log conversation turn: %s", e)
+        logger.warning("log_turn failed: %s", e)
 
     return ChatResponse(reply=reply)
 
