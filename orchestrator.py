@@ -9,7 +9,7 @@ from agents.style_agent import StyleAgent
 from agents.personality_agent import PersonalityAgent
 from agents.joy_agent import JoyAgent
 from agents.cultural_agent import CulturalAgent
-from agents.response_agent import ResponseAgentV12  # <── LƯU Ý DÒNG NÀY
+from agents.response_agent import ResponseAgent  # <── LƯU Ý DÒNG NÀY
 
 from identity import IDENTITY_PROMPT
 from support_blocks import ADELAIDE_SUPPORT_BLOCK
