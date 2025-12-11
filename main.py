@@ -16,7 +16,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL_ID = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
 
 client = Groq(api_key=GROQ_API_KEY)
-orchestrator = OrchestratorV12(model_id=MODEL_ID, client=client)
+orchestrator = Orchestrator(model_id=MODEL_ID, client=client)
 
 init_db()
 
