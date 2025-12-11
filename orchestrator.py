@@ -9,7 +9,7 @@ from agents.style_agent import StyleAgent
 from agents.personality_agent import PersonalityAgent
 from agents.joy_agent import JoyAgent
 from agents.cultural_agent import CulturalAgent
-from agents.response_agent import ResponseAgent  # <── LƯU Ý DÒNG NÀY
+from agents.response_agent import ResponseAgent  # <── dùng ResponseAgent
 
 from identity import IDENTITY_PROMPT
 from support_blocks import ADELAIDE_SUPPORT_BLOCK
@@ -38,7 +38,7 @@ class Orchestrator:
         self.personality = PersonalityAgent(model_id, client)
         self.joy = JoyAgent()
         self.culture = CulturalAgent()
-        self.response = ResponseAgentV12(model_id, client, IDENTITY_PROMPT)
+        self.response = ResponseAgent(model_id, client, IDENTITY_PROMPT)  # <── dòng này
 
     def run(
         self,
@@ -48,13 +48,10 @@ class Orchestrator:
         profile_type=None,
         profile_region=None,
     ):
-        # 1) lưu user message
         append_message(student_id, "user", user_message)
 
-        # 2) Insight
         insights = self.insight.run(user_message, history)
 
-        # 3) update emotional state
         update_emotional_state(
             session_id=student_id,
             primary_emotion=insights.get("emotion"),
@@ -63,45 +60,29 @@ class Orchestrator:
             notes="; ".join(insights.get("topics", [])),
         )
 
-        # 4) Profile summary (internal)
         profile_summary = self.profile.run(student_id, insights)
         set_summary(student_id, profile_summary)
 
-        # 5) Trend
         trend = self.trend.run(student_id, insights, history)
-
-        # 6) Safety
         safety = self.safety.run(user_message, insights)
-
-        # 7) Intervention
         interventions = self.intervention.run(insights, trend, user_message)
-
-        # 8) Style
         style_hint = self.style.run(student_id, history, insights)
 
-        # 9) Personality
         personality = self.personality.run(
             full_history=history,
             recent_msgs=history[-3:],
         )
 
-        # 10) Joy mode
         joy_mode = self.joy.update_state(history, user_message)
-
-        # 11) Cultural profile
         cultural_block = self.culture.run(profile_type, profile_region)
-
-        # 12) Memory summary
         memory_summary = get_summary_or_default(student_id)
 
-        # 13) Support block (high risk)
         support_block = (
             ADELAIDE_SUPPORT_BLOCK
             if safety.get("override_risk_level") == "high"
             else ""
         )
 
-        # 14) Gọi ResponseAgent
         reply = self.response.run(
             user_message=user_message,
             history=history,
@@ -119,10 +100,8 @@ class Orchestrator:
             support_block=support_block,
         )
 
-        # 15) lưu reply
         append_message(student_id, "assistant", reply)
 
-        # 16) log để nghiên cứu
         try:
             log_turn(
                 session_id=student_id,
