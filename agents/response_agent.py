@@ -1,13 +1,30 @@
 # agents/response_agent.py
 
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 from groq import Groq
 
 
 class ResponseAgent:
     """
-    Final response composer cho Wellbeing Companion V12.
-    Nhận toàn bộ thông tin từ Orchestrator và gọi LLM để sinh câu trả lời cuối.
+    Final response agent for Wellbeing Companion V12.
+
+    Orchestrator sẽ gọi:
+      self.response.run(
+          user_message=...,
+          history=...,
+          insights=...,
+          trend=...,
+          interventions=...,
+          safety=...,
+          style_hint=...,
+          personality=...,
+          memory_summary=...,
+          pronoun_pref=...,
+          joy_mode=...,
+          cultural_block=...,
+          language=...,
+          support_block=...,
+      )
     """
 
     def __init__(self, model_id: str, client: Groq, identity_prompt: str):
@@ -33,108 +50,102 @@ class ResponseAgent:
         language: str,
         support_block: str,
     ) -> str:
-        """
-        Compose system prompt + history + user_message và gọi Groq LLM.
-        """
+        # Chuẩn hóa history sang format messages của Groq
+        replay_messages: List[Dict[str, str]] = []
+        for m in history or []:
+            # m có dạng {"role": "...", "content": "..."} từ frontend
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            replay_messages.append({"role": role, "content": content})
 
-        # Joy mode instructions
-        joy_instructions = ""
+        # Hướng dẫn đặc biệt cho joy mode
+        joy_block = ""
         if joy_mode:
-            joy_instructions = """
-JOY MODE:
-- The student is sharing clearly positive news with low risk.
-- Reply like a close uni friend celebrating with them.
-- Warm, playful, excited tone.
-- You MAY ask ONE light follow-up question (e.g. “How will you celebrate?”).
-- Do NOT mention coping skills, CBT, journaling, breathing, or services.
+            joy_block = """
+The student is currently sharing clearly positive or celebratory news.
+Stay in a joyful, friendly, peer-like tone.
+Do NOT introduce CBT techniques or university services in this reply.
+Sound like a close uni friend celebrating with them.
 """
 
-        # Safety instructions
-        safety_instructions = ""
-        if safety.get("override_risk_level") == "high":
-            safety_instructions = """
-HIGH RISK:
-- Be very gentle and caring.
-- Validate their pain and distress.
-- You may gently ask if they are in a safe place and if someone they trust is nearby.
-- Encourage reaching out to trusted people or support services.
-- Do NOT minimise or ignore their feelings.
+        # Hướng dẫn cho support block (khi nguy cơ cao)
+        support_instruction = ""
+        if support_block:
+            support_instruction = f"""
+The safety layer marked this situation as HIGH RISK.
+
+In this reply you MUST:
+1) First, in the SAME LANGUAGE as the student, write 1–2 short sentences
+   gently suggesting they consider reaching out for extra support.
+2) After your own message, append the following support information
+   verbatim, without translating or modifying it:
+
+{support_block}
 """
 
-        # Personality block
-        personality_block = f"""
-PERSONALITY SNAPSHOT (internal only):
-- Big Five: {personality.get("big_five")}
-- Resilience: {personality.get("resilience")}
-- Coping style: {personality.get("coping_style")}
-- Dynamic modifiers: {personality.get("dynamic_modifiers")}
-"""
-
+        # System prompt tổng hợp
         system_prompt = f"""
 {self.identity_prompt}
 
-You are replying in language code: {language}.
+You are part of a multi-agent wellbeing system for first-year university students.
+Another set of agents has already analysed the situation for you.
 
-====================
-INTERNAL MEMORY SUMMARY
-====================
+Language code for this conversation: {language}
+
+Conversation summary (internal memory):
 {memory_summary}
 
-Pronoun preference (Vietnamese, if applicable): {pronoun_pref}
-
-====================
-PERSONALITY PROFILE
-====================
-{personality_block}
-
-====================
-CULTURAL PROFILE
-====================
-{cultural_block}
-
-====================
-LATEST INSIGHTS
-====================
+Emotional insights:
 {insights}
 
-Trend info:
+Short-term trend:
 {trend}
 
-Style hint for tone:
+Personality / resilience / coping style signals (approximate, internal only):
+{personality}
+
+Style hint (how you should talk to this student):
 {style_hint}
 
-Interventions you MAY weave in (unless joy mode is active):
+Cultural profile block:
+{cultural_block}
+
+Direct interventions suggested by the Intervention Agent:
 {interventions}
 
-{joy_instructions}
-{safety_instructions}
+Pronoun preference info (if any, in Vietnamese): {pronoun_pref}
 
-Rules:
-- Talk like a close friend, not a therapist or doctor.
-- Keep sentences short, clear, and warm.
-- No moral lectures, no generic life-coach speeches.
-- Stay within the emotional context of the conversation.
+Safety info (internal):
+{safety}
+
+Joy mode state: {joy_mode}
+{joy_block}
+{support_instruction}
+
+General rules:
+- You are NOT a therapist and must not present yourself as one.
+- You speak like a warm, respectful uni friend.
+- Keep replies concise, concrete, and easy to read.
+- Be emotionally validating, never judgmental.
+- Follow the student's language: if they use Vietnamese, reply in Vietnamese;
+  if they use English, reply in English, etc.
 """
 
-        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+        ]
 
-        # Add short history (role/content dicts đến từ orchestrator)
-        for m in history:
-            messages.append({"role": m["role"], "content": m["content"]})
+        # thêm history rút gọn
+        messages.extend(replay_messages)
 
+        # thêm message mới nhất
         messages.append({"role": "user", "content": user_message})
 
         completion = self.client.chat.completions.create(
             model=self.model_id,
+            messages=messages,
             temperature=0.65,
             max_tokens=800,
-            messages=messages,
         )
-
-        reply = completion.choices[0].message.content.strip()
-
-        # Nếu high-risk và có support_block (Adelaide services) thì append ở cuối
-        if safety.get("override_risk_level") == "high" and support_block:
-            reply += "\n\n" + support_block
-
-        return reply
+        reply = completion.choices[0].message.content or ""
+        return reply.strip()
