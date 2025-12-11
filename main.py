@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
-from orchestrator import OrchestratorV12
+from orchestrator import Orchestrator
 from conversation_logging import init_db, attach_export_routes
 
 logging.basicConfig(level=logging.INFO)
