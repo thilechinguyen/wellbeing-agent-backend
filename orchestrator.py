@@ -1,4 +1,4 @@
-# orchestrator.py — V12.1 (UoA-aware + Faculty routing + softer CBT)
+# orchestrator.py — V12.2 (University of Adelaide INTERNAL assistant)
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ def _safe_str(x: Any) -> str:
 
 
 def _clamp_history(history: Any, max_turns: int = 12) -> List[Dict[str, str]]:
-    """Ensure history is list[{'role','content'}], clamp to last max_turns."""
     if not isinstance(history, list):
         return []
 
@@ -40,17 +39,10 @@ def _clamp_history(history: Any, max_turns: int = 12) -> List[Dict[str, str]]:
             continue
         cleaned.append({"role": role, "content": content})
 
-    if len(cleaned) > max_turns:
-        cleaned = cleaned[-max_turns:]
-    return cleaned
+    return cleaned[-max_turns:]
 
 
 def _extract_meta_from_message(user_message: str) -> Tuple[Dict[str, str], str]:
-    """
-    Supports old format:
-      [lang=vi;profile_type=domestic;profile_region=au] hello
-    Returns (meta_dict, message_without_prefix)
-    """
     m = META_PREFIX_RE.match(user_message or "")
     if not m:
         return {}, user_message
@@ -61,86 +53,18 @@ def _extract_meta_from_message(user_message: str) -> Tuple[Dict[str, str], str]:
         "profile_region": (m.group("pregion") or "").strip(),
     }
     meta = {k: v for k, v in meta.items() if v}
-    stripped = (user_message[m.end() :] if user_message else "").lstrip()
+    stripped = (user_message[m.end():] if user_message else "").lstrip()
     return meta, stripped
 
 
 # -----------------------------
-# UoA detection + faculty routing
+# Faculty + stress helpers
 # -----------------------------
-UOA_HINTS = [
-    "university of adelaide",
-    "uofa",
-    "adelaide.edu.au",
-    "myadelaide",
-    "ask adelaide",
-    "hub central",
-    "hubcentral",
-    "student hub",
-    "north terrace",
-]
-
-ACADEMIC_ADVICE_KEYWORDS = [
-    # vi
-    "cố vấn",
-    "co van",
-    "học vụ",
-    "hoc vu",
-    "chọn môn",
-    "chon mon",
-    "lộ trình",
-    "lo trinh",
-    "rớt môn",
-    "rot mon",
-    "nguy cơ rớt",
-    "deadline",
-    "quá tải",
-    "qua tai",
-    "học không kịp",
-    "hoc khong kip",
-    "cần hỗ trợ học",
-    "can ho tro hoc",
-    "support học",
-    # en
-    "academic advisor",
-    "academic advising",
-    "course plan",
-    "program advice",
-    "enrol",
-    "enrollment",
-    "failed a course",
-    "struggling with study",
-]
-
 STRESS_HINTS = [
-    "stress",
-    "stressed",
-    "overwhelmed",
-    "burnout",
-    "lo lắng",
-    "lo au",
-    "hoảng",
-    "hoang",
-    "khủng hoảng",
-    "khung hoang",
-    "trầm cảm",
-    "tram cam",
-    "mất ngủ",
-    "mat ngu",
-    "kiệt sức",
-    "kiet suc",
-    "panic",
+    "stress", "stressed", "overwhelmed", "burnout",
+    "lo lắng", "khủng hoảng", "trầm cảm",
+    "mất ngủ", "kiệt sức", "panic",
 ]
-
-
-def _looks_like_uoa(text: str) -> bool:
-    t = (text or "").lower()
-    return any(h in t for h in UOA_HINTS)
-
-
-def _is_academic_advice_question(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in ACADEMIC_ADVICE_KEYWORDS)
 
 
 def _stress_level_hint(text: str) -> bool:
@@ -149,51 +73,15 @@ def _stress_level_hint(text: str) -> bool:
 
 
 def _uoa_faculty_bucket(message: str) -> str:
-    """
-    Rough inference from message:
-    - SET: sciences/engineering/tech
-    - HMS: health/medical
-    - ABLE: arts/business/law/econ
-    """
     t = (message or "").lower()
 
-    if any(x in t for x in ["engineering", "engineer", "kỹ thuật", "ki thuat", "science", "khoa học", "computer", "it", "set"]):
+    if any(x in t for x in ["engineering", "science", "computer", "it", "kỹ thuật", "khoa học"]):
         return "SET"
-    if any(x in t for x in ["health", "medical", "medicine", "nursing", "hms", "y khoa", "dược", "duoc", "điều dưỡng", "dieu duong"]):
+    if any(x in t for x in ["health", "medical", "medicine", "nursing", "y khoa"]):
         return "HMS"
-    if any(x in t for x in ["business", "law", "economics", "arts", "able", "luật", "luat", "kinh tế", "kinh te", "commerce"]):
+    if any(x in t for x in ["education", "business", "law", "arts", "kinh tế", "luật"]):
         return "ABLE"
     return "UNKNOWN"
-
-
-def _uoa_academic_advice_reply(lang: str, faculty_bucket: str) -> str:
-    """Deterministic UoA-specific reply when user asks academic advising / support."""
-    faculty_line_vi = (
-        f"2) **Student Success Team** theo Faculty của em (**{faculty_bucket}**) để hỗ trợ học vụ, kế hoạch học, và kết nối đúng cố vấn.\n"
-        if faculty_bucket in ("SET", "HMS", "ABLE")
-        else "2) **Student Success Team** theo Faculty (ABLE / HMS / SET) để hỗ trợ học vụ và kết nối đúng cố vấn.\n"
-    )
-
-    if lang == "en":
-        fac = faculty_bucket if faculty_bucket != "UNKNOWN" else "ABLE / HMS / SET"
-        return (
-            "If you study at the **University of Adelaide**, the fastest pathway is:\n\n"
-            "1) **Student Hub / Hub Central** (best starting point) – they will direct you to the right service.\n"
-            f"2) **Student Success Team** for your Faculty (**{fac}**) for academic/program advice.\n"
-            "3) **Academic Skills** (Writing Centre, Maths Learning Centre, PASS, English Assist) for study skills.\n"
-            "4) If stress is affecting study, consider **Counselling Support**.\n\n"
-            "One quick question: which subject or deadline is worrying you most right now?"
-        )
-
-    # VI default
-    return (
-        "Nếu em học tại **University of Adelaide**, em có thể đi theo lộ trình nhanh nhất như sau\n\n"
-        "1) **Student Hub / Hub Central** (điểm bắt đầu tốt nhất) để họ chỉ đúng kênh hỗ trợ.\n"
-        f"{faculty_line_vi}"
-        "3) **Student Academic Skills & Support** (Writing Centre, Maths Learning Centre, PASS, English Assist…) để cải thiện kỹ năng học.\n"
-        "4) Nếu stress/lo âu ảnh hưởng việc học, em có thể đặt lịch **Counselling Support**.\n\n"
-        "Mình hỏi 1 câu ngắn thôi: hiện giờ em lo nhất là môn nào hoặc deadline nào?"
-    )
 
 
 # -----------------------------
@@ -202,24 +90,17 @@ def _uoa_academic_advice_reply(lang: str, faculty_bucket: str) -> str:
 @dataclass
 class StudentContext:
     student_id: str
-    language: str = "vi"            # vi/en/zh
-    profile_type: str = "unknown"   # domestic/international/unknown
-    profile_region: str = "unknown" # au/sea/eu/other/unknown
-    university: str = "unknown"     # "uoa" or "unknown"
+    language: str = "vi"
+    profile_type: str = "domestic"
+    profile_region: str = "au"
+    faculty: str = "UNKNOWN"
+    university: str = "University of Adelaide"   # 🔒 FIXED
 
 
 # -----------------------------
 # Orchestrator
 # -----------------------------
 class Orchestrator:
-    """
-    V12.1 Orchestrator:
-    - UoA auto-detection + academic support fast-path
-    - Faculty bucket inference (SET/HMS/ABLE)
-    - Softer CBT tone when stress hints are present
-    - Calls Groq chat.completions for general cases
-    """
-
     def __init__(self, model_id: str, client: Any):
         self.model_id = model_id
         self.client = client
@@ -230,88 +111,83 @@ class Orchestrator:
         profile_type: Optional[str],
         profile_region: Optional[str],
         meta: Dict[str, str],
-        combined_text_for_uni_detect: str,
+        user_message: str,
     ) -> StudentContext:
         lang = (meta.get("language") or "vi").lower()
-        ptype = (meta.get("profile_type") or profile_type or "unknown").strip().lower()
-        preg = (meta.get("profile_region") or profile_region or "unknown").strip().lower()
-
-        # normalize profile type
-        if ptype in ("domestic", "sv trong nuoc", "sv trong nước", "local"):
-            ptype = "domestic"
-        elif ptype in ("international", "sv quoc te", "sv quốc tế", "intl"):
-            ptype = "international"
-        elif not ptype:
-            ptype = "unknown"
-
-        # normalize region
-        if preg in ("au", "australia"):
-            preg = "au"
-        elif preg in ("sea", "southeast asia", "south-east asia"):
-            preg = "sea"
-        elif preg in ("eu", "europe"):
-            preg = "eu"
-        elif preg in ("other",):
-            preg = "other"
-        elif not preg:
-            preg = "unknown"
-
         if lang not in ("vi", "en", "zh"):
             lang = "vi"
 
-        university = "uoa" if _looks_like_uoa(combined_text_for_uni_detect) else "unknown"
+        ptype = (meta.get("profile_type") or profile_type or "domestic").lower()
+        preg = (meta.get("profile_region") or profile_region or "au").lower()
+
+        faculty = _uoa_faculty_bucket(user_message)
 
         return StudentContext(
             student_id=student_id,
             language=lang,
             profile_type=ptype,
             profile_region=preg,
-            university=university,
+            faculty=faculty,
         )
 
+    # 🔒 SYSTEM PROMPT vFinal — INTERNAL UoA ASSISTANT
     def _system_prompt(self, ctx: StudentContext, is_stress: bool) -> str:
-        # language rules
-        if ctx.language == "en":
-            lang_rule = "Respond in English by default (you may add 1–2 short Vietnamese clarifications if helpful)."
-        elif ctx.language == "zh":
-            lang_rule = "默认用中文回复（必要时可补充简短英文/越南语解释）。"
-        else:
-            lang_rule = "Trả lời ưu tiên bằng tiếng Việt (có thể kèm 1–2 câu tiếng Anh nếu hữu ích)."
-
-        profile_hint = f"Student profile: type={ctx.profile_type}, region={ctx.profile_region}, university={ctx.university}."
-
-        # softer CBT stance if stress signs
-        if is_stress:
-            style = (
-                "Tone: extra gentle, validating, calm. "
-                "Start by reflecting feelings in one sentence. "
-                "Ask ONE short question. "
-                "Then give 2–4 tiny next steps (10 minutes / today / this week)."
-            )
-        else:
-            style = (
-                "Tone: warm, validating, practical. "
-                "Ask ONE short clarifying question when needed. "
-                "Offer 2–4 concrete next steps."
-            )
-
-        return (
-            "You are a non-judgmental, trauma-informed wellbeing support assistant for university students. "
-            "Your job is to provide emotional support and gentle CBT-aligned guidance.\n"
-            "Rules:\n"
-            f"- {style}\n"
-            "- Do NOT provide medical diagnosis.\n"
-            "- Do NOT shame, blame, or judge the student.\n"
-            "- If the user expresses self-harm intent, encourage immediate help and provide crisis resources.\n"
-            f"- {lang_rule}\n"
-            f"- {profile_hint}\n"
+        tone = (
+            "Tone: extra gentle, validating, calm. "
+            "Reflect feelings first. Ask ONE short question. "
+            "Offer 2–4 small, doable next steps."
+            if is_stress
+            else
+            "Tone: warm, supportive, practical. Ask ONE clarifying question if needed."
         )
 
-    def _user_context_block(self, ctx: StudentContext) -> str:
         return (
-            f"(Context) student_id={ctx.student_id}, "
-            f"profile_type={ctx.profile_type}, profile_region={ctx.profile_region}, "
-            f"ui_language={ctx.language}, university={ctx.university}."
+            "You are xChatbot, an INTERNAL wellbeing and student-support assistant "
+            "working for the University of Adelaide (Australia).\n\n"
+
+            "Your users are FIRST-YEAR undergraduate students at the University of Adelaide.\n\n"
+
+            "You speak AS IF you are part of the University of Adelaide’s internal "
+            "student support system — not an external advisor and not a generic chatbot.\n\n"
+
+            "CORE RULES:\n"
+            "- Always speak from an internal perspective using phrases like "
+            "'here at the University of Adelaide', 'at Adelaide', "
+            "'our Student Services', 'our campus'.\n"
+            "- NEVER generalise using phrases such as "
+            "'ở các trường đại học', 'at universities in Australia', "
+            "'many universities'.\n"
+            "- ALWAYS prioritise University of Adelaide services first.\n\n"
+
+            "LANGUAGE:\n"
+            "- Respond in the student’s UI language "
+            "(Vietnamese / English / Chinese).\n"
+            "- You may keep official service names in English.\n\n"
+
+            "SUPPORT STYLE:\n"
+            f"- {tone}\n"
+            "- Do NOT provide medical diagnoses.\n\n"
+
+            "DEFAULT UNIVERSITY SERVICES TO REFER TO:\n"
+            "- Ask Adelaide (Student Hub Central)\n"
+            "- Student Care\n"
+            "- University Counselling Support\n"
+            "- Academic Skills & Learning Centre\n"
+            "- Faculty Student Support Offices (ABLE / HMS / SET)\n"
+            "- Student Finance & Scholarships\n"
+            "- Student Emergency Fund\n\n"
+
+            f"Faculty context (if known): {ctx.faculty}\n\n"
+
+            "CRISIS SAFETY:\n"
+            "- If self-harm or suicidal intent is mentioned, "
+            "encourage immediate professional help and "
+            "refer to University of Adelaide crisis support.\n\n"
+
+            "FINAL RULE:\n"
+            "You are not a general chatbot. "
+            "You are a trusted internal assistant speaking "
+            "on behalf of the University of Adelaide."
         )
 
     def _call_llm(self, messages: List[Dict[str, str]]) -> str:
@@ -319,16 +195,13 @@ class Orchestrator:
             completion = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=messages,
-                temperature=0.7,
-                max_tokens=700,
+                temperature=0.65,
+                max_tokens=800,
             )
             return completion.choices[0].message.content.strip()
         except Exception as e:
             logger.exception("LLM call failed: %s", e)
-            return (
-                "Mình đang gặp lỗi khi kết nối mô hình để tạo phản hồi. "
-                "Bạn thử gửi lại trong ít phút nữa nhé."
-            )
+            return "Mình đang gặp lỗi kỹ thuật. Bạn thử gửi lại sau ít phút nhé."
 
     def run(
         self,
@@ -338,53 +211,28 @@ class Orchestrator:
         profile_type: Optional[str] = None,
         profile_region: Optional[str] = None,
     ) -> str:
-        # 1) parse metadata prefix if any
         meta, cleaned_message = _extract_meta_from_message(user_message or "")
-        cleaned_message = cleaned_message.strip() or (user_message or "").strip()
+        cleaned_message = cleaned_message.strip()
 
-        # 2) normalize history
         hist = _clamp_history(history or [])
 
-        # 3) create combined text for university detection (message + history)
-        hist_text = " ".join(m.get("content", "") for m in hist if isinstance(m, dict))
-        combined_text = f"{hist_text}\n{cleaned_message}"
-
-        # 4) build context
         ctx = self._build_student_context(
             student_id=student_id,
             profile_type=profile_type,
             profile_region=profile_region,
             meta=meta,
-            combined_text_for_uni_detect=combined_text,
+            user_message=cleaned_message,
         )
 
-        # 5) UoA fast-path: academic advising/support
-        if ctx.university == "uoa" and _is_academic_advice_question(cleaned_message):
-            bucket = _uoa_faculty_bucket(cleaned_message)
-            return _uoa_academic_advice_reply(ctx.language, bucket)
-
-        # 6) stress hint → softer prompt
         is_stress = _stress_level_hint(cleaned_message)
 
-        # 7) build prompt messages
-        sys = self._system_prompt(ctx, is_stress=is_stress)
-        ctx_block = self._user_context_block(ctx)
+        system_prompt = self._system_prompt(ctx, is_stress)
 
-        messages: List[Dict[str, str]] = [{"role": "system", "content": sys}]
-        messages.append({"role": "system", "content": ctx_block})
-
-        # append history (skip any system role from client)
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         for m in hist:
-            if m["role"] == "system":
-                continue
-            messages.append(m)
-
+            if m["role"] != "system":
+                messages.append(m)
         messages.append({"role": "user", "content": cleaned_message})
 
-        # 8) call LLM
         reply = self._call_llm(messages)
-
-        if not reply:
-            reply = "Mình ở đây với bạn. Bạn có thể nói thêm một chút về điều đang xảy ra không?"
-
-        return reply
+        return reply or "Mình ở đây với bạn. Bạn có thể chia sẻ thêm không?"
